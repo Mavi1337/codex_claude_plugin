@@ -9,6 +9,7 @@ Orchestrate focused Luna implementation workers and fresh Sol reviewers while
 Claude remains controller, adjudicator, and integration owner.
 
 **REQUIRED SUB-SKILL:** Use `codex-worker-runtime` for every runtime operation.
+Compose the first Luna message with `gpt-5-4-prompting`.
 
 When an implementation plan is ready, offer three implementation modes:
 inline, native Claude subagent-driven development, or Codex worker development.
@@ -17,7 +18,10 @@ If the user already chose Codex development, proceed without asking again.
 ## Start
 
 1. Read the plan and binding spec. Build tasks with dependencies and expected
-   path ownership.
+   path ownership. If the repo carries agent instructions (`CLAUDE.md`,
+   `AGENTS.md`), pass them via `--requirement` too: Luna works in a fresh
+   worktree, so test commands, interpreter paths, and commit-message rules
+   only reach it that way.
 2. Show task count, maximum concurrency (at most five), Luna
    `gpt-5.6-luna/xhigh`, Sol `gpt-5.6-sol/high`, and optional final
    `gpt-5.6-sol/xhigh` review. Obtain one authorization to dispatch.
