@@ -4,6 +4,14 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// The suite is usually run from inside a Claude Code session, which exports the very variables
+// the plugin reads to locate its state and scope jobs to a session. Inherited, they point tests at
+// the developer's real plugin data and filter out the fixtures the tests just wrote. Every test
+// that needs one of these sets it explicitly, so clear the ambient values once, at import.
+for (const name of ["CLAUDE_PLUGIN_DATA", "CLAUDE_ENV_FILE", "CLAUDE_PROJECT_DIR", "CODEX_COMPANION_SESSION_ID", "CODEX_COMPANION_TRANSCRIPT_PATH"]) {
+  delete process.env[name];
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
