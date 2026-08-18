@@ -65,6 +65,8 @@ class AppServerClientBase {
     this.exitError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
+    this.serverRequestHandler = null;
+    this.serverRequests = new Map();
     this.lineBuffer = "";
     this.transport = "unknown";
 
@@ -76,6 +78,27 @@ class AppServerClientBase {
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
   }
+
+  setServerRequestHandler(handler) {
+    this.serverRequestHandler = handler;
+  }
+
+  respondToServerRequest(id, result) {
+    if (!this.serverRequests.has(id)) {
+      throw new Error(`Unknown or already resolved app-server request: ${id}.`);
+    }
+    this.serverRequests.delete(id);
+    this.sendMessage({ id, result });
+  }
+
+  rejectServerRequest(id, code, message, data) {
+    if (!this.serverRequests.has(id)) {
+      throw new Error(`Unknown or already resolved app-server request: ${id}.`);
+    }
+    this.serverRequests.delete(id);
+    this.sendMessage({ id, error: buildJsonRpcError(code, message, data) });
+  }
+
 
   /**
    * @template {AppServerMethod} M
@@ -154,6 +177,16 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
+    if (this.serverRequestHandler) {
+      this.serverRequests.set(message.id, message);
+      try {
+        this.serverRequestHandler(message);
+      } catch (error) {
+        this.serverRequests.delete(message.id);
+        this.sendMessage({ id: message.id, error: buildJsonRpcError(-32603, error.message) });
+      }
+      return;
+    }
     this.sendMessage({
       id: message.id,
       error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
@@ -172,6 +205,7 @@ class AppServerClientBase {
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
+    this.serverRequests.clear();
     this.resolveExit(undefined);
   }
 
@@ -351,4 +385,5 @@ export class CodexAppServerClient {
     await client.initialize();
     return client;
   }
+
 }

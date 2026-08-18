@@ -16,6 +16,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const pendingServerRequests = new Map();
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -284,6 +285,26 @@ rl.on("line", (line) => {
   const state = loadState();
 
   try {
+    if (message.method === undefined && message.id !== undefined) {
+      const pendingRequest = pendingServerRequests.get(message.id);
+      if (pendingRequest) {
+        pendingServerRequests.delete(message.id);
+        state.lastServerResponse = message;
+        saveState(state);
+        const answer = message.result && message.result.answers
+          ? JSON.stringify(message.result.answers)
+          : JSON.stringify(message.result || {});
+        emitTurnCompleted(pendingRequest.threadId, pendingRequest.turnId, {
+          completed: {
+            type: "agentMessage",
+            id: "msg_" + pendingRequest.turnId,
+            text: "Resolved input: " + answer,
+            phase: "final_answer"
+          }
+        });
+      }
+      return;
+    }
     switch (message.method) {
       case "initialize":
         state.capabilities = message.params.capabilities || null;
@@ -453,6 +474,23 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "blocking-input") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          const serverRequestId = "server_" + turnId;
+          pendingServerRequests.set(serverRequestId, { threadId: thread.id, turnId });
+          send({
+            id: serverRequestId,
+            method: "item/tool/requestUserInput",
+            params: {
+              threadId: thread.id,
+              turnId,
+              itemId: "item_" + turnId,
+              questions: [{ id: "choice", header: "Choice", question: "Continue?", options: [] }]
+            }
+          });
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
