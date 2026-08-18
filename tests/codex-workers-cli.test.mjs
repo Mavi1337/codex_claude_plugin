@@ -256,3 +256,30 @@ test("session end remains a no-op success outside a Git repository", () => {
   });
   assert.equal(ended.status, 0, ended.stderr);
 });
+
+test("coordinator restart replaces the running daemon so edited plugin code is reloaded", async (t) => {
+  const repo = makeTempDir("worker-cli-repo-");
+  const dataRoot = makeTempDir("worker-cli-data-");
+  const binDir = makeTempDir("worker-cli-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }); });
+
+  const first = invoke(["coordinator", "status", "--cwd", repo], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const firstPid = first.parsed.result.coordinatorPid;
+
+  const restarted = invoke(["coordinator", "restart", "--cwd", repo], { cwd: repo, env });
+  assert.equal(restarted.status, 0, restarted.stderr);
+  assert.equal(restarted.parsed.status, "restarted");
+  assert.equal(restarted.parsed.previousPid, firstPid);
+
+  const second = invoke(["coordinator", "status", "--cwd", repo], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.notEqual(second.parsed.result.coordinatorPid, firstPid);
+  assert.equal(second.parsed.result.status, "online");
+});

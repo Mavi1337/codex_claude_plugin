@@ -56,10 +56,15 @@ export async function sendCoordinatorRequest(session, operation, params = {}, op
     const socket = net.createConnection({ path: target.path });
     socket.setEncoding("utf8");
     let buffer = "";
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("Timed out waiting for worker coordinator."));
-    }, options.timeoutMs ?? 10000);
+    // A timeout of 0 means "block indefinitely" — `worker wait --timeout 0` blocks until the turn
+    // reaches a terminal state, so the transport must not impose a deadline of its own.
+    const budget = options.timeoutMs ?? 10000;
+    const timer = budget > 0
+      ? setTimeout(() => {
+        socket.destroy();
+        reject(new Error("Timed out waiting for worker coordinator."));
+      }, budget)
+      : null;
     socket.on("connect", () => socket.write(`${JSON.stringify(envelope)}\n`));
     socket.on("data", (chunk) => {
       buffer += chunk;
@@ -256,6 +261,23 @@ export async function ensureCoordinatorSession(cwd, options = {}) {
     }
     throw new Error(`Worker coordinator failed to start. See ${paths.logFile}.`);
   } finally { releaseStartup(); }
+}
+
+// The coordinator daemon reads prompts, schemas, and its own module graph once at startup, so
+// edits to the plugin only take effect after it is replaced. Restart shuts the running daemon
+// down, waits for the process to actually exit, and starts a fresh one.
+export async function restartCoordinatorSession(cwd, options = {}) {
+  const previous = loadCoordinatorSession(cwd, options);
+  const stopped = await shutdownCoordinatorSession(cwd, options);
+  if (previous?.pid) {
+    const deadline = Date.now() + 5000;
+    while (processIsAlive(previous.pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (processIsAlive(previous.pid)) throw new Error(`Worker coordinator PID ${previous.pid} did not exit; refusing to start a second coordinator.`);
+  }
+  const session = await ensureCoordinatorSession(cwd, options);
+  return { status: "restarted", previousStatus: stopped.status, previousPid: previous?.pid ?? null, pid: session.pid };
 }
 
 export async function shutdownCoordinatorSession(cwd, options = {}) {
