@@ -12,6 +12,7 @@ function initialState(repositoryId) {
     revision: 0,
     repositoryId,
     workers: {},
+    reviews: {},
     queue: [],
     idempotency: {},
     integrationLease: null,

@@ -15,6 +15,10 @@ class FakeClient {
   setNotificationHandler(handler) { this.notifications = handler; }
   setServerRequestHandler(handler) { this.serverRequests = handler; }
   async request(method, params) {
+    if (method === "model/list") return { data: [
+      { id: "gpt-5.6-luna", model: "gpt-5.6-luna", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] },
+      { id: "gpt-5.6-sol", model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] }
+    ] };
     if (method === "thread/start") return { thread: { id: `thread-${params.cwd.split("/").pop()}` } };
     if (method === "thread/resume") return { thread: { id: params.threadId } };
     if (method === "turn/start") {

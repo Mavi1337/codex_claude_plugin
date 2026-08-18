@@ -12,13 +12,21 @@ import {
 function parse(argv) {
   const positionals = [];
   const options = {};
+  const booleans = new Set(["json", "worktree", "staged", "unstaged", "task-review"]);
+  const repeatable = new Set(["path", "file", "audit-path"]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (!value.startsWith("--")) { positionals.push(value); continue; }
     const key = value.slice(2);
-    if (key === "json") { options.json = true; continue; }
+    if (booleans.has(key)) { options[key] = true; continue; }
     if (index + 1 >= argv.length) throw new Error(`Missing value for --${key}.`);
-    options[key] = argv[++index];
+    const next = argv[++index];
+    if (repeatable.has(key)) {
+      options[key] ??= [];
+      options[key].push(next);
+    } else {
+      options[key] = next;
+    }
   }
   return { positionals, options };
 }
@@ -43,6 +51,28 @@ async function main() {
   let params = {};
   if (group === "coordinator" && action === "status") {
     operation = "coordinator.status";
+  } else if (group === "review") {
+    if (!["start", "status", "result"].includes(action)) throw new Error(`Unknown review operation: ${action}.`);
+    operation = `review.${action}`;
+    params.reviewId = assertSafeId(required(options, "review"), "review");
+    if (action === "start") {
+      params.orchestrationId = assertSafeId(required(options, "orchestration"), "orchestration");
+      params.cwd = cwd;
+      params.effort = options.effort;
+      params.maxInputTokens = options["max-input-tokens"] ? Number(options["max-input-tokens"]) : undefined;
+      params.target = {
+        base: options.base,
+        range: options.range,
+        last: options.last ? Number(options.last) : undefined,
+        worktree: options.worktree === true,
+        staged: options.staged === true,
+        unstaged: options.unstaged === true,
+        auditPaths: options["audit-path"],
+        paths: options.path,
+        files: options.file
+      };
+      params.taskReview = options["task-review"] === true;
+    }
   } else if (group === "worker") {
     if (!["start", "send", "wait", "status", "list", "stop", "close", "resume", "resolve-request"].includes(action)) {
       throw new Error(`Unknown worker operation: ${action}.`);
@@ -89,5 +119,6 @@ try {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = /Missing|required|Unknown|must match|Usage/.test(error.message)
     ? 2
-    : error.code === "UNAUTHORIZED" ? 4 : 1;
+    : error.code === "COMPATIBILITY" ? 3
+      : error.code === "UNAUTHORIZED" ? 4 : 1;
 }

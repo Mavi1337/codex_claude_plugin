@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Worker Turn Output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "status", "summary", "tests", "changedFiles", "concerns"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "status": { "enum": ["completed", "completed_with_concerns", "needs_input", "blocked"] },
+    "summary": { "type": "string" },
+    "tests": { "type": "array", "items": { "type": "object", "required": ["command", "result"], "properties": { "command": { "type": "string" }, "result": { "type": "string" } }, "additionalProperties": false } },
+    "changedFiles": { "type": "array", "items": { "type": "string" } },
+    "concerns": { "type": "array", "items": { "type": "string" } },
+    "question": { "type": ["string", "null"] }
+  }
+}

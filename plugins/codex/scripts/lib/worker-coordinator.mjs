@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 
 import { CodexAppServerClient } from "./app-server.mjs";
 import { assertSafeId } from "./worker-protocol.mjs";
 import { createWorkerStore } from "./worker-state.mjs";
 import { applyReviewedCommits, commitTaskWorktree, createTaskWorktree } from "./worker-worktree.mjs";
+import { resolveWorkerReviewTarget } from "./review-target.mjs";
+import { freezeReviewPackage } from "./review-package.mjs";
+import { evaluateReviewGate, validateSolReview } from "./worker-review.mjs";
+
+const SOL_SCHEMA_URL = new URL("../../schemas/sol-review-output.schema.json", import.meta.url);
+const SOL_TASK_PROMPT_URL = new URL("../../prompts/sol-task-reviewer.md", import.meta.url);
+const SOL_BRANCH_PROMPT_URL = new URL("../../prompts/sol-branch-reviewer.md", import.meta.url);
 
 const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitation/request"]);
 const APPROVAL_METHODS = new Set([
@@ -76,6 +84,13 @@ export class WorkerCoordinator {
         });
         break;
       }
+      case "review.start": result = await this.startReview(params, idempotencyKey); break;
+      case "review.status":
+      case "review.result": {
+        result = this.store.load().reviews?.[assertSafeId(params.reviewId, "reviewId")];
+        if (!result) throw new Error(`Unknown review ${params.reviewId}.`);
+        break;
+      }
       case "coordinator.status": result = {
         status: "online", repositoryId: this.store.identity.repositoryId,
         activeTurns: this.activeTurns, queuedTurns: this.store.load().queue.length,
@@ -95,8 +110,24 @@ export class WorkerCoordinator {
     if (existing && existing.supervisorStatus !== "closed") throw new Error(`Worker ${workerId} already exists.`);
     const role = options.role ?? "luna";
     const profile = role === "sol"
-      ? { model: "gpt-5.6-sol", effort: options.effort ?? "high", sandbox: "read-only", approvalPolicy: "never", ephemeral: true }
-      : { model: "gpt-5.6-luna", effort: "xhigh", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false };
+      ? {
+          model: "gpt-5.6-sol", effort: options.effort ?? "high", sandbox: "read-only",
+          approvalPolicy: "never", ephemeral: true,
+          config: { model_context_window: 258000, model_auto_compact_token_limit: 220000 }
+        }
+      : { model: "gpt-5.6-luna", effort: "xhigh", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false, config: null };
+    const client = await this.clientFactory(options.cwd, { role, profile });
+    try {
+      const models = await client.request("model/list", { includeHidden: true });
+      const selected = models.data?.find((candidate) => candidate.model === profile.model || candidate.id === profile.model);
+      if (!selected) throw Object.assign(new Error(`Required worker model ${profile.model} is unavailable; update Codex or select an account/provider that offers it.`), { code: "COMPATIBILITY" });
+      const efforts = new Set((selected.supportedReasoningEfforts ?? []).map((entry) => entry.reasoningEffort));
+      if (!efforts.has(profile.effort)) throw Object.assign(new Error(`Model ${profile.model} does not support required effort ${profile.effort}.`), { code: "COMPATIBILITY" });
+    } catch (error) {
+      await client.close().catch(() => {});
+      if (!error.code) error.code = "COMPATIBILITY";
+      throw error;
+    }
     let workerCwd = options.workerCwd ?? options.cwd;
     let worktree = null;
     if (role === "luna" && options.isolated !== false) {
@@ -108,12 +139,11 @@ export class WorkerCoordinator {
       });
       workerCwd = worktree.worktree;
     }
-    const client = await this.clientFactory(workerCwd, { role, profile });
     client.setNotificationHandler((message) => this.#handleNotification(workerId, message));
     client.setServerRequestHandler((message) => this.#handleServerRequest(workerId, message));
     const response = options.threadId
-      ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox })
-      : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral });
+      ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: profile.config })
+      : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: profile.config });
     const record = {
       id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
       branch: worktree?.branch ?? null, baseCommit: worktree?.base ?? null,
@@ -127,7 +157,7 @@ export class WorkerCoordinator {
     return record;
   }
 
-  async send(workerId, prompt, idempotencyKey) {
+  async send(workerId, prompt, idempotencyKey, turnOptions = {}) {
     assertSafeId(workerId, "workerId");
     assertSafeId(idempotencyKey, "idempotencyKey");
     const state = this.store.load();
@@ -137,7 +167,10 @@ export class WorkerCoordinator {
     if (worker.turn && !["completed", "failed", "interrupted", "indeterminate"].includes(worker.turn.status)) {
       throw new Error(`Worker ${workerId} already has an active turn.`);
     }
-    const entry = { id: `queue-${randomUUID()}`, workerId, prompt: String(prompt), idempotencyKey, queuedAt: nowIso() };
+    const entry = {
+      id: `queue-${randomUUID()}`, workerId, prompt: String(prompt), idempotencyKey,
+      outputSchema: turnOptions.outputSchema ?? null, queuedAt: nowIso()
+    };
     this.store.transaction((next) => {
       next.queue.push(entry);
       next.workers[workerId].turn = { id: null, status: "queued", queuedAt: entry.queuedAt };
@@ -146,6 +179,90 @@ export class WorkerCoordinator {
     const result = started.has(entry.id) ? { workerId, status: "running" } : { workerId, status: "queued" };
     this.store.transaction((next) => { next.idempotency[idempotencyKey] = result; });
     return result;
+  }
+
+  async startReview(params, idempotencyKey) {
+    const reviewId = assertSafeId(params.reviewId, "reviewId");
+    const orchestrationId = assertSafeId(params.orchestrationId, "orchestrationId");
+    const target = resolveWorkerReviewTarget(params.cwd, params.target ?? {});
+    const reviewPackage = freezeReviewPackage(params.cwd, target, { maxInputTokens: params.maxInputTokens ?? 190000 });
+    const schema = JSON.parse(fs.readFileSync(SOL_SCHEMA_URL, "utf8"));
+    const promptTemplate = fs.readFileSync(params.taskReview ? SOL_TASK_PROMPT_URL : SOL_BRANCH_PROMPT_URL, "utf8");
+    const maxInputTokens = params.maxInputTokens ?? 190000;
+    const packageFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/package.md`, reviewPackage.content);
+    const packages = reviewPackage.partitions.length > 1
+      ? reviewPackage.partitions.map((partition, index) => {
+          const scoped = freezeReviewPackage(params.cwd, { ...target, paths: partition.paths }, { maxInputTokens });
+          const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/pass-${index + 1}.md`, scoped.content);
+          return { ...scoped, file, passId: `pass-${index + 1}` };
+        })
+      : [{ ...reviewPackage, file: packageFile, passId: "pass-1" }];
+    const passReviews = [];
+    for (let index = 0; index < packages.length; index += 1) {
+      const item = packages[index];
+      const executed = await this.#executeReviewPass({
+        workerId: `sol-${reviewId}-p${index + 1}`,
+        orchestrationId,
+        cwd: params.cwd,
+        effort: params.taskReview ? "high" : (params.effort ?? "xhigh"),
+        prompt: `${promptTemplate}\n\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
+        schema,
+        idempotencyKey: `${idempotencyKey}-pass-${index + 1}`,
+        timeoutMs: params.timeoutMs,
+        reviewId,
+        passId: item.passId
+      });
+      passReviews.push(executed.review);
+      this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/${item.passId}.json`, `${JSON.stringify(executed.review, null, 2)}\n`);
+    }
+    let review = passReviews[0];
+    let finalWorker = null;
+    if (passReviews.length > 1) {
+      const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify(passReviews, null, 2)}\n`);
+      const executed = await this.#executeReviewPass({
+        workerId: `sol-${reviewId}-synth`, orchestrationId, cwd: params.cwd, effort: "xhigh",
+        prompt: `${promptTemplate}\n\nSynthesize every bounded pass in ${synthesisFile}. Preserve material findings and verify coverage.`,
+        schema, idempotencyKey: `${idempotencyKey}-synthesis`, timeoutMs: params.timeoutMs,
+        reviewId, passId: "synthesis"
+      });
+      review = executed.review;
+      finalWorker = executed.worker;
+    }
+    const gate = evaluateReviewGate(review);
+    const reportFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, gate, packageHash: reviewPackage.hash }, null, 2)}\n`);
+    const result = {
+      id: reviewId, status: "completed", workerId: finalWorker?.id ?? `sol-${reviewId}-p1`,
+      threadId: finalWorker?.thread.id ?? this.status(`sol-${reviewId}-p1`).thread.id,
+      specVerdict: review.specVerdict, qualityVerdict: review.qualityVerdict,
+      findings: review.findings, summary: review.summary, gate, packageFile,
+      packageHash: reviewPackage.hash, reportFile,
+      effort: finalWorker?.effort ?? this.status(`sol-${reviewId}-p1`).effort,
+      passCount: passReviews.length, synthesized: passReviews.length > 1,
+      completedAt: nowIso()
+    };
+    this.store.transaction((state) => {
+      state.reviews ??= {};
+      state.reviews[reviewId] = result;
+      if (params.workerId && state.workers[params.workerId]) state.workers[params.workerId].reviewGate = gate.status;
+    });
+    return result;
+  }
+
+  async #executeReviewPass(options) {
+    const worker = await this.startWorker({
+      workerId: options.workerId,
+      orchestrationId: options.orchestrationId,
+      cwd: options.cwd,
+      role: "sol",
+      effort: options.effort
+    });
+    await this.send(worker.id, options.prompt, `${options.idempotencyKey}-turn`, { outputSchema: options.schema });
+    const finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
+    if (finished.turn?.status !== "completed") throw new Error(`Sol review did not complete: ${finished.turn?.status ?? "unknown"}.`);
+    let parsed;
+    try { parsed = JSON.parse(finished.lastOutput ?? ""); }
+    catch (error) { throw new Error(`Sol returned invalid structured review output: ${error.message}`); }
+    return { worker, review: validateSolReview(parsed, { reviewId: options.reviewId, passId: options.passId }) };
   }
 
   status(workerId) {
@@ -232,7 +349,7 @@ export class WorkerCoordinator {
     if (!client) throw new Error(`Worker ${entry.workerId} is not connected.`);
     const response = await client.request("turn/start", {
       threadId: worker.thread.id, input: turnInput(entry.prompt), model: worker.model,
-      effort: worker.effort, outputSchema: null
+      effort: worker.effort, outputSchema: entry.outputSchema
     });
     this.store.transaction((state) => {
       const turn = state.workers[entry.workerId].turn;
@@ -243,6 +360,13 @@ export class WorkerCoordinator {
   }
 
   #handleNotification(workerId, message) {
+    if (message.method === "item/completed") {
+      const item = message.params?.item;
+      if (item?.type === "agentMessage" && item.text) {
+        this.store.transaction((state) => { state.workers[workerId].lastOutput = item.text; });
+      }
+      return;
+    }
     if (message.method !== "turn/started" && message.method !== "turn/completed") return;
     let terminal = false;
     this.store.transaction((state) => {

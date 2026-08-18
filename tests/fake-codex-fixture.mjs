@@ -233,6 +233,16 @@ function structuredReviewPayload(prompt) {
   });
 }
 
+function solReviewPayload() {
+  return JSON.stringify({
+    schemaVersion: 1,
+    specVerdict: "pass",
+    qualityVerdict: "approve",
+    summary: "The frozen package contains no material issue.",
+    findings: []
+  });
+}
+
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
@@ -326,6 +336,19 @@ rl.on("line", (line) => {
         send({ id: message.id, result: buildConfigReadResult() });
         break;
 
+      case "model/list":
+        send({
+          id: message.id,
+          result: {
+            data: BEHAVIOR === "missing-worker-models" ? [] : [
+              { id: "gpt-5.6-luna", model: "gpt-5.6-luna", supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "xhigh" }] },
+              { id: "gpt-5.6-sol", model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] }
+            ],
+            nextCursor: null
+          }
+        });
+        break;
+
       case "thread/start": {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
@@ -334,6 +357,8 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        state.lastThreadStart = message.params;
+        saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -492,9 +517,11 @@ rl.on("line", (line) => {
           break;
         }
 
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.specVerdict
+          ? solReviewPayload()
+          : message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+            ? structuredReviewPayload(prompt)
+            : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
         if (
           BEHAVIOR === "with-subagent" ||
