@@ -7,11 +7,13 @@ import { createWorkerStore } from "./worker-state.mjs";
 import { applyReviewedCommits, commitTaskWorktree, createTaskWorktree } from "./worker-worktree.mjs";
 import { resolveWorkerReviewTarget } from "./review-target.mjs";
 import { freezeReviewPackage } from "./review-package.mjs";
-import { evaluateReviewGate, validateSolReview } from "./worker-review.mjs";
+import { evaluateReviewGate, validateSolReview, validateWorkerResult } from "./worker-review.mjs";
 
 const SOL_SCHEMA_URL = new URL("../../schemas/sol-review-output.schema.json", import.meta.url);
 const SOL_TASK_PROMPT_URL = new URL("../../prompts/sol-task-reviewer.md", import.meta.url);
 const SOL_BRANCH_PROMPT_URL = new URL("../../prompts/sol-branch-reviewer.md", import.meta.url);
+const WORKER_SCHEMA_URL = new URL("../../schemas/worker-turn-output.schema.json", import.meta.url);
+const LUNA_PROMPT_URL = new URL("../../prompts/luna-implementer.md", import.meta.url);
 
 const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitation/request"]);
 const APPROVAL_METHODS = new Set([
@@ -167,9 +169,15 @@ export class WorkerCoordinator {
     if (worker.turn && !["completed", "failed", "interrupted", "indeterminate"].includes(worker.turn.status)) {
       throw new Error(`Worker ${workerId} already has an active turn.`);
     }
+    const lunaSchema = worker.role === "luna" && turnOptions.outputSchema === undefined
+      ? JSON.parse(fs.readFileSync(WORKER_SCHEMA_URL, "utf8"))
+      : null;
+    const rolePrompt = worker.role === "luna" && turnOptions.outputSchema === undefined
+      ? `${fs.readFileSync(LUNA_PROMPT_URL, "utf8")}\n\nTask instruction:\n${String(prompt)}`
+      : String(prompt);
     const entry = {
-      id: `queue-${randomUUID()}`, workerId, prompt: String(prompt), idempotencyKey,
-      outputSchema: turnOptions.outputSchema ?? null, queuedAt: nowIso()
+      id: `queue-${randomUUID()}`, workerId, prompt: rolePrompt, idempotencyKey,
+      outputSchema: turnOptions.outputSchema ?? lunaSchema, queuedAt: nowIso()
     };
     this.store.transaction((next) => {
       next.queue.push(entry);
@@ -389,9 +397,32 @@ export class WorkerCoordinator {
       }
     });
     if (terminal) {
+      this.#finalizeWorkerResult(workerId);
       this.activeTurns = Math.max(0, this.activeTurns - 1);
       this.#notifyWaiters(workerId);
       void this.#pump();
+    }
+  }
+
+  #finalizeWorkerResult(workerId) {
+    const worker = this.status(workerId);
+    if (worker.role !== "luna") return;
+    try {
+      const result = validateWorkerResult(JSON.parse(worker.lastOutput ?? ""));
+      const reportFile = this.store.writeArtifact(
+        worker.orchestrationId,
+        `tasks/${worker.id}/implementation-report.json`,
+        `${JSON.stringify(result, null, 2)}\n`
+      );
+      this.store.transaction((state) => {
+        state.workers[workerId].result = result;
+        state.workers[workerId].reportFile = reportFile;
+      });
+    } catch (error) {
+      this.store.transaction((state) => {
+        state.workers[workerId].turn.status = "failed";
+        state.workers[workerId].turn.error = `Invalid structured worker output: ${error.message}`;
+      });
     }
   }
 

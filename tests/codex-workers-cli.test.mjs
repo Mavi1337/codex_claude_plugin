@@ -7,6 +7,7 @@ import { installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const SCRIPT = path.resolve("plugins/codex/scripts/codex-workers.mjs");
+const SESSION_HOOK = path.resolve("plugins/codex/scripts/session-lifecycle-hook.mjs");
 
 function invoke(args, options) {
   const result = run("node", [SCRIPT, ...args, "--json"], options);
@@ -48,6 +49,9 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
   assert.equal(status.parsed.result.thread.id, started.parsed.result.thread.id);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.lastTurnStart.outputSchema.properties.status.enum.includes("completed"), true);
+  assert.match(fakeState.lastTurnStart.prompt, /do not run `git commit`/i);
+  assert.equal(fs.existsSync(waited.parsed.result.reportFile), true);
 });
 
 test("worker CLI rejects an unsafe explicit ID before contacting the coordinator", () => {
@@ -150,4 +154,28 @@ test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed co
   const applied = invoke(["integration", "apply", "--cwd", repo, "--worker", "luna-task", "--expected-head", base], { cwd: repo, env });
   assert.equal(applied.status, 0, applied.stderr);
   assert.equal(fs.readFileSync(path.join(repo, "app.js"), "utf8"), "implemented\n");
+});
+
+test("session end closes coordinator app-servers while preserving worker state", () => {
+  const repo = makeTempDir("worker-session-repo-");
+  const dataRoot = makeTempDir("worker-session-data-");
+  const binDir = makeTempDir("worker-session-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-session", "--orchestration", "orch-1"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ cwd: repo, session_id: "session-1" })
+  });
+  assert.equal(ended.status, 0, ended.stderr);
+  const shutdown = invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env });
+  assert.equal(shutdown.parsed.status, "not-running");
+  const stateFiles = fs.readdirSync(path.join(dataRoot, "worker-state"), { recursive: true });
+  assert.equal(stateFiles.some((entry) => String(entry).endsWith("state.json")), true);
 });

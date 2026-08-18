@@ -75,10 +75,12 @@ test("continue is not exposed as a user-facing command", () => {
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
     "cancel.md",
+    "develop.md",
     "rescue.md",
     "result.md",
     "review.md",
     "setup.md",
+    "sol-review.md",
     "status.md",
     "transfer.md"
   ]);
@@ -222,4 +224,20 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("worker development and flexible Sol review entrypoints are discoverable", () => {
+  const develop = read("commands/develop.md");
+  const solReview = read("commands/sol-review.md");
+  const developmentSkill = read("skills/codex-worker-development/SKILL.md");
+  const runtimeSkill = read("skills/codex-worker-runtime/SKILL.md");
+
+  assert.match(develop, /codex-worker-development/);
+  assert.match(develop, /task count.*concurrency.*gpt-5\.6-luna.*gpt-5\.6-sol/is);
+  assert.match(solReview, /codex-workers\.mjs/);
+  assert.match(solReview, /branch|worktree|staged|unstaged|range|file|audit/i);
+  assert.match(developmentSkill, /implementation plan is ready/i);
+  assert.match(developmentSkill, /offer.*inline.*subagent.*Codex worker/is);
+  assert.match(runtimeSkill, /worker resolve-request/);
+  assert.match(runtimeSkill, /integration apply/);
 });

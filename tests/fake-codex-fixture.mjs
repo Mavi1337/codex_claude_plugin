@@ -243,6 +243,17 @@ function solReviewPayload() {
   });
 }
 
+function workerTurnPayload() {
+  return JSON.stringify({
+    schemaVersion: 1,
+    status: "completed",
+    summary: "Implemented the requested task.",
+    tests: [{ command: "npm test", result: "passed" }],
+    changedFiles: ["app.js"],
+    concerns: []
+  });
+}
+
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
@@ -495,6 +506,7 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          outputSchema: message.params.outputSchema ?? null,
 	          prompt
 	        };
 	        saveState(state);
@@ -519,6 +531,8 @@ rl.on("line", (line) => {
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.specVerdict
           ? solReviewPayload()
+          : message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.status
+            ? workerTurnPayload()
           : message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
             ? structuredReviewPayload(prompt)
             : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));

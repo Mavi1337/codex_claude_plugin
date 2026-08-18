@@ -31,3 +31,15 @@ export function evaluateReviewGate(review, options = {}) {
   if (review.specVerdict === "cannot-verify" && options.controllerRuling?.waive === true) return { status: "pass-with-ruling", reason: options.controllerRuling.reason };
   return { status: "block", reason: review.specVerdict !== "pass" ? `Specification verdict is ${review.specVerdict}.` : "Code quality requires changes." };
 }
+
+export function validateWorkerResult(value) {
+  const statuses = new Set(["completed", "completed_with_concerns", "needs_input", "blocked"]);
+  if (!value || value.schemaVersion !== 1 || !statuses.has(value.status)) throw new Error("Invalid worker result status or schema version.");
+  if (typeof value.summary !== "string" || !Array.isArray(value.tests) || !Array.isArray(value.changedFiles) || !Array.isArray(value.concerns)) {
+    throw new Error("Invalid worker result fields.");
+  }
+  for (const test of value.tests) {
+    if (!test || typeof test.command !== "string" || typeof test.result !== "string") throw new Error("Invalid worker test result.");
+  }
+  return value;
+}
