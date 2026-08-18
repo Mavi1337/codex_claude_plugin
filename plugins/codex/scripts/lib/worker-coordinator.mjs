@@ -184,15 +184,23 @@ export class WorkerCoordinator {
   async startReview(params, idempotencyKey) {
     const reviewId = assertSafeId(params.reviewId, "reviewId");
     const orchestrationId = assertSafeId(params.orchestrationId, "orchestrationId");
-    const target = resolveWorkerReviewTarget(params.cwd, params.target ?? {});
-    const reviewPackage = freezeReviewPackage(params.cwd, target, { maxInputTokens: params.maxInputTokens ?? 190000 });
+    const reviewedWorker = params.workerId ? this.status(params.workerId) : null;
+    if (reviewedWorker && (!reviewedWorker.baseCommit || !reviewedWorker.headCommit)) {
+      throw new Error(`Worker ${params.workerId} has no coordinator-created commit to review.`);
+    }
+    const reviewCwd = reviewedWorker?.cwd ?? params.cwd;
+    const targetOptions = reviewedWorker
+      ? { range: `${reviewedWorker.baseCommit}..${reviewedWorker.headCommit}` }
+      : (params.target ?? {});
+    const target = resolveWorkerReviewTarget(reviewCwd, targetOptions);
+    const reviewPackage = freezeReviewPackage(reviewCwd, target, { maxInputTokens: params.maxInputTokens ?? 190000 });
     const schema = JSON.parse(fs.readFileSync(SOL_SCHEMA_URL, "utf8"));
     const promptTemplate = fs.readFileSync(params.taskReview ? SOL_TASK_PROMPT_URL : SOL_BRANCH_PROMPT_URL, "utf8");
     const maxInputTokens = params.maxInputTokens ?? 190000;
     const packageFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/package.md`, reviewPackage.content);
     const packages = reviewPackage.partitions.length > 1
       ? reviewPackage.partitions.map((partition, index) => {
-          const scoped = freezeReviewPackage(params.cwd, { ...target, paths: partition.paths }, { maxInputTokens });
+          const scoped = freezeReviewPackage(reviewCwd, { ...target, paths: partition.paths }, { maxInputTokens });
           const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/pass-${index + 1}.md`, scoped.content);
           return { ...scoped, file, passId: `pass-${index + 1}` };
         })
@@ -203,7 +211,7 @@ export class WorkerCoordinator {
       const executed = await this.#executeReviewPass({
         workerId: `sol-${reviewId}-p${index + 1}`,
         orchestrationId,
-        cwd: params.cwd,
+        cwd: reviewCwd,
         effort: params.taskReview ? "high" : (params.effort ?? "xhigh"),
         prompt: `${promptTemplate}\n\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
         schema,
@@ -220,7 +228,7 @@ export class WorkerCoordinator {
     if (passReviews.length > 1) {
       const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify(passReviews, null, 2)}\n`);
       const executed = await this.#executeReviewPass({
-        workerId: `sol-${reviewId}-synth`, orchestrationId, cwd: params.cwd, effort: "xhigh",
+        workerId: `sol-${reviewId}-synth`, orchestrationId, cwd: reviewCwd, effort: "xhigh",
         prompt: `${promptTemplate}\n\nSynthesize every bounded pass in ${synthesisFile}. Preserve material findings and verify coverage.`,
         schema, idempotencyKey: `${idempotencyKey}-synthesis`, timeoutMs: params.timeoutMs,
         reviewId, passId: "synthesis"

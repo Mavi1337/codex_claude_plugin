@@ -127,3 +127,27 @@ test("oversized Sol review runs bounded passes and a fresh xhigh synthesis", (t)
   assert.ok(state.appServerStarts >= 3);
   assert.equal(state.lastTurnStart.effort, "xhigh");
 });
+
+test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed commits", (t) => {
+  const repo = makeTempDir("worker-integrate-repo-");
+  const dataRoot = makeTempDir("worker-integrate-data-");
+  const binDir = makeTempDir("worker-integrate-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "base\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  const base = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-task", "--orchestration", "orch-1"], { cwd: repo, env });
+  fs.writeFileSync(path.join(started.parsed.result.cwd, "app.js"), "implemented\n");
+
+  const committed = invoke(["integration", "commit", "--cwd", repo, "--worker", "luna-task", "--message", "task: implement", "--allowed-path", "app.js"], { cwd: repo, env });
+  assert.equal(committed.status, 0, committed.stderr);
+  const reviewed = invoke(["review", "start", "--cwd", repo, "--review", "task-review", "--orchestration", "orch-1", "--worker", "luna-task", "--task-review"], { cwd: repo, env });
+  assert.equal(reviewed.parsed.result.gate.status, "pass");
+  const applied = invoke(["integration", "apply", "--cwd", repo, "--worker", "luna-task", "--expected-head", base], { cwd: repo, env });
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(fs.readFileSync(path.join(repo, "app.js"), "utf8"), "implemented\n");
+});

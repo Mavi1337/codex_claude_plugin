@@ -13,7 +13,7 @@ function parse(argv) {
   const positionals = [];
   const options = {};
   const booleans = new Set(["json", "worktree", "staged", "unstaged", "task-review"]);
-  const repeatable = new Set(["path", "file", "audit-path"]);
+  const repeatable = new Set(["path", "file", "audit-path", "allowed-path"]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (!value.startsWith("--")) { positionals.push(value); continue; }
@@ -51,6 +51,16 @@ async function main() {
   let params = {};
   if (group === "coordinator" && action === "status") {
     operation = "coordinator.status";
+  } else if (group === "integration") {
+    if (!["commit", "apply"].includes(action)) throw new Error(`Unknown integration operation: ${action}.`);
+    operation = `integration.${action}`;
+    params.workerId = assertSafeId(required(options, "worker"), "worker");
+    if (action === "commit") {
+      params.message = required(options, "message");
+      params.allowedPaths = options["allowed-path"];
+    } else {
+      params.expectedHead = required(options, "expected-head");
+    }
   } else if (group === "review") {
     if (!["start", "status", "result"].includes(action)) throw new Error(`Unknown review operation: ${action}.`);
     operation = `review.${action}`;
@@ -72,6 +82,7 @@ async function main() {
         files: options.file
       };
       params.taskReview = options["task-review"] === true;
+      if (options.worker) params.workerId = assertSafeId(options.worker, "worker");
     }
   } else if (group === "worker") {
     if (!["start", "send", "wait", "status", "list", "stop", "close", "resume", "resolve-request"].includes(action)) {
