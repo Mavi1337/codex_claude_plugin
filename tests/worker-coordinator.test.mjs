@@ -162,8 +162,34 @@ test("permission approvals use the generated permissions response shape", async 
   });
   const request = coordinator.status("luna-permission").pendingRequest;
   assert.throws(() => coordinator.resolveRequest(request.id, { decision: "accept" }, "permission-invalid"), /permissions/i);
-  const valid = { permissions: { fileSystem: { write: [cwd] } }, scope: "turn", strictAutoReview: true };
+  assert.throws(() => coordinator.resolveRequest(request.id, {
+    permissions: {}, scope: null
+  }, "permission-invalid-scope"), /scope/i);
+  assert.throws(() => coordinator.resolveRequest(request.id, {
+    permissions: { network: { enabled: "yes" } }, scope: "turn"
+  }, "permission-invalid-nested"), /enabled/i);
+  const valid = { permissions: { network: null, fileSystem: { write: [cwd] } }, scope: "turn", strictAutoReview: null };
   const resolved = coordinator.resolveRequest(request.id, valid, "permission-valid");
+  assert.equal(resolved.status, "resolved");
+  assert.deepEqual(client.lastResponse.result, valid);
+});
+
+test("standalone URL elicitations accept the generated nullable response shape", async () => {
+  const cwd = makeTempDir("coordinator-mcp-");
+  const dataRoot = makeTempDir("coordinator-data-");
+  initGitRepo(cwd);
+  let client;
+  const coordinator = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => (client = new FakeClient()) });
+  const worker = await coordinator.startWorker({ workerId: "luna-mcp", orchestrationId: "orch-1", cwd, role: "luna", isolated: false });
+  client.serverRequests({
+    id: 45,
+    method: "mcpServer/elicitation/request",
+    params: { threadId: worker.thread.id, turnId: null, mode: "url", serverName: "example", message: "Open the login page?", url: "https://example.test", elicitationId: "elicit-1" }
+  });
+  const request = coordinator.status(worker.id).pendingRequest;
+  assert.equal(coordinator.status(worker.id).turn, null);
+  const valid = { action: "accept", content: null, _meta: null };
+  const resolved = coordinator.resolveRequest(request.id, valid, "resolve-mcp");
   assert.equal(resolved.status, "resolved");
   assert.deepEqual(client.lastResponse.result, valid);
 });
@@ -219,6 +245,7 @@ test("controller ruling can explicitly waive cannot-verify but not failed qualit
     state.workers["luna-rule"] = { id: "luna-rule", reviewGate: "block", reviewBinding: { reviewId: "review-rule", gate: "block" } };
     state.reviews["review-rule"] = {
       id: "review-rule", status: "completed", reviewedWorkerId: "luna-rule",
+      orchestrationId: "orch-1", reportFile: coordinator.store.writeArtifact("orch-1", "reviews/review-rule/report.json", JSON.stringify({ gate: { status: "block" } })),
       specVerdict: "cannot-verify", qualityVerdict: "approve", findings: [], summary: "Missing external evidence."
     };
   });
@@ -227,6 +254,9 @@ test("controller ruling can explicitly waive cannot-verify but not failed qualit
   }, "rule-key");
   assert.equal(ruled.gate.status, "pass-with-ruling");
   assert.equal(coordinator.status("luna-rule").reviewGate, "pass-with-ruling");
+  const report = JSON.parse(fs.readFileSync(ruled.reportFile, "utf8"));
+  assert.equal(report.gate.status, "pass-with-ruling");
+  assert.equal(report.controllerRuling.reason, "Controller supplied and checked the missing external evidence.");
 });
 
 test("review start claims idempotency before long-running side effects", async () => {

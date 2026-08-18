@@ -204,7 +204,12 @@ export async function ensureCoordinatorSession(cwd, options = {}) {
     if (loaded?.pid && processIsAlive(loaded.pid)) {
       throw new Error(`Recorded worker coordinator PID ${loaded.pid} is alive but not responding; refusing to replace its endpoint.`);
     }
-    if (owner) fs.rmSync(path.join(store.rootDir, "coordinator-owner.lock"), { recursive: true });
+    if (owner) {
+      if (processIsAlive(owner.pid)) {
+        throw new Error(`Worker coordinator ownership record for PID ${owner.pid} is live but could not be authenticated; refusing to replace it.`);
+      }
+      fs.rmSync(path.join(store.rootDir, "coordinator-owner.lock"), { recursive: true });
+    }
 
     fs.mkdirSync(store.rootDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(paths.sessionDir, { recursive: true, mode: 0o700 });

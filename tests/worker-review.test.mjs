@@ -86,6 +86,9 @@ test("Sol review schema supports location-free findings and deterministic gates"
   assert.equal(evaluateReviewGate(review).status, "block");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "approve", findings: [] }).status, "pass");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "changes-required" }).status, "block");
+  assert.equal(evaluateReviewGate({ ...review, qualityVerdict: "changes-required" }, {
+    controllerRuling: { waive: true, reason: "Controller verified the missing requirement evidence." }
+  }).status, "block");
 });
 
 test("Sol validation rejects unknown fields and replaces model-provided finding IDs", () => {

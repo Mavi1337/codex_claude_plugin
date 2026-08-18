@@ -66,3 +66,18 @@ test("worker state rejects a second live process lock owner", () => {
   const releaseAgain = store.acquireOwnership("test-owner");
   releaseAgain();
 });
+
+test("worker state does not reclaim a lock with corrupt owner metadata", () => {
+  const root = makeTempDir("worker-state-corrupt-owner-");
+  const repo = makeTempDir("worker-state-corrupt-repo-");
+  initGitRepo(repo);
+  const store = createWorkerStore(repo, { dataRoot: root });
+  const lockDir = path.join(store.rootDir, "corrupt-owner.lock");
+  const release = store.acquireOwnership("corrupt-owner");
+  release();
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"), "{corrupt", "utf8");
+  const stale = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockDir, stale, stale);
+  assert.throws(() => store.acquireOwnership("corrupt-owner"), /already owned/i);
+});

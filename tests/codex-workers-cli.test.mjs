@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { ensureCoordinatorSession, shutdownCoordinatorSession } from "../plugins/codex/scripts/lib/worker-coordinator-lifecycle.mjs";
+import { createWorkerStore } from "../plugins/codex/scripts/lib/worker-state.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 const SCRIPT = path.resolve("plugins/codex/scripts/codex-workers.mjs");
@@ -87,6 +88,22 @@ test("simultaneous coordinator discovery publishes one live owner", async (t) =>
   assert.equal(JSON.parse(fs.readFileSync(recovered.metadataFile, "utf8")).pid, first.pid);
 });
 
+test("metadata recovery refuses to replace an unauthenticated live owner", async () => {
+  const repo = makeTempDir("worker-owner-repo-");
+  const dataRoot = makeTempDir("worker-owner-data-");
+  initGitRepo(repo);
+  const store = createWorkerStore(repo, { dataRoot });
+  const lockDir = path.join(store.rootDir, "coordinator-owner.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, executable: "/not-the-current-runtime", startIdentity: "reused" }));
+  fs.writeFileSync(path.join(store.rootDir, "coordinator.token"), "token");
+  await assert.rejects(
+    () => ensureCoordinatorSession(repo, { dataRoot, env: process.env }),
+    /live but could not be authenticated/i
+  );
+  assert.equal(fs.existsSync(path.join(lockDir, "owner.json")), true);
+});
+
 test("worker CLI rejects an unsafe explicit ID before contacting the coordinator", () => {
   const repo = makeTempDir("worker-cli-repo-");
   const dataRoot = makeTempDir("worker-cli-data-");
@@ -165,6 +182,9 @@ test("oversized Sol review runs bounded passes and a fresh xhigh synthesis", (t)
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.ok(state.appServerStarts >= 3);
   assert.equal(state.lastTurnStart.effort, "xhigh");
+  const synthesisInput = JSON.parse(fs.readFileSync(path.join(path.dirname(reviewed.parsed.result.reportFile), "synthesis-input.json"), "utf8"));
+  assert.ok(synthesisInput.passReviews.length >= 2);
+  assert.equal(synthesisInput.passReviews.every((pass) => typeof pass.passId === "string" && Array.isArray(pass.paths) && /^[a-f0-9]{64}$/.test(pass.packageHash)), true);
 });
 
 test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed commits", (t) => {

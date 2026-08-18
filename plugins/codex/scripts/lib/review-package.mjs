@@ -193,7 +193,12 @@ function buildManifestPartitions(target, collected, extraSections, packageHash, 
     partitions.push({ paths: [], content });
   }
   if (partitions.length > 1) {
-    const coverage = partitions.map((partition, index) => ({ pass: index + 1, ownedPaths: partition.paths }));
+    const coverage = partitions.map((partition, index) => ({
+      pass: index + 1,
+      id: partition.crossCutting ? "cross-cutting" : `pass-${index + 1}`,
+      ownedPaths: partition.paths,
+      packageHash: sha(partition.content)
+    }));
     const content = renderPackage(target, collected.manifest, [{
       title: "Cross-cutting interfaces, tests, and coverage map",
       body: `Review relationships across all owned paths and verify every coverage-map entry reaches synthesis.\n\n${JSON.stringify(coverage, null, 2)}`

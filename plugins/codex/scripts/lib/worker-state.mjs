@@ -87,13 +87,6 @@ function processIdentity(pid) {
   return { pid, executable, startIdentity };
 }
 
-function ownerMatchesLiveProcess(owner) {
-  const current = processIdentity(owner?.pid);
-  if (!current) return false;
-  if (!owner.executable || !owner.startIdentity || !current.executable || !current.startIdentity) return true;
-  return owner.executable === current.executable && owner.startIdentity === current.startIdentity;
-}
-
 function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -131,7 +124,10 @@ export function createWorkerStore(cwd, options = {}) {
         let owner = null;
         try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")); } catch {}
         const stat = fs.statSync(lockDir);
-        if ((!owner || !ownerMatchesLiveProcess(owner)) && Date.now() - stat.mtimeMs > 30000) {
+        // A malformed or identity-mismatched owner record is not proof that the
+        // lock is stale: the PID may still be live (or reused). Fail closed and
+        // require explicit cleanup instead of creating a second state writer.
+        if (owner && !processIsAlive(owner.pid) && Date.now() - stat.mtimeMs > 30000) {
           fs.rmSync(lockDir, { recursive: true });
           continue;
         }

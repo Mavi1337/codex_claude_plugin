@@ -42,7 +42,13 @@ export function validateSolReview(value, context = {}) {
 
 export function evaluateReviewGate(review, options = {}) {
   if (review.specVerdict === "pass" && review.qualityVerdict === "approve") return { status: "pass", reason: "Both required verdicts pass." };
-  if (review.specVerdict === "cannot-verify" && options.controllerRuling?.waive === true) return { status: "pass-with-ruling", reason: options.controllerRuling.reason };
+  if (
+    review.specVerdict === "cannot-verify"
+    && review.qualityVerdict === "approve"
+    && options.controllerRuling?.waive === true
+    && typeof options.controllerRuling.reason === "string"
+    && options.controllerRuling.reason.trim()
+  ) return { status: "pass-with-ruling", reason: options.controllerRuling.reason };
   return { status: "block", reason: review.specVerdict !== "pass" ? `Specification verdict is ${review.specVerdict}.` : "Code quality requires changes." };
 }
 

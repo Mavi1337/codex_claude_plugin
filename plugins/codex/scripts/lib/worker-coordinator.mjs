@@ -50,9 +50,21 @@ function sanitizeRequestValue(value, key = "", depth = 0) {
 }
 
 function allowedRequestDecisions(method, params) {
-  const explicit = Array.isArray(params?.availableDecisions) ? sanitizeRequestValue(params.availableDecisions) : null;
-  if (explicit?.length) return explicit;
-  if (method === "item/commandExecution/requestApproval") return ["accept", "acceptForSession", "decline", "cancel"];
+  if (Array.isArray(params?.availableDecisions)) return sanitizeRequestValue(params.availableDecisions);
+  if (method === "item/commandExecution/requestApproval") {
+    if (params?.networkApprovalContext) {
+      const decisions = ["accept", "acceptForSession"];
+      const amendment = (params.proposedNetworkPolicyAmendments ?? []).find((entry) => entry?.action === "allow");
+      if (amendment) decisions.push({ applyNetworkPolicyAmendment: { network_policy_amendment: amendment } });
+      return [...decisions, "cancel"];
+    }
+    if (params?.additionalPermissions) return ["accept", "cancel"];
+    const decisions = ["accept"];
+    if (params?.proposedExecpolicyAmendment) {
+      decisions.push({ acceptWithExecpolicyAmendment: { execpolicy_amendment: params.proposedExecpolicyAmendment } });
+    }
+    return [...decisions, "cancel"];
+  }
   if (method === "item/fileChange/requestApproval") return ["accept", "acceptForSession", "decline", "cancel"];
   if (method === "mcpServer/elicitation/request") return ["accept", "decline", "cancel"];
   return [];
@@ -62,6 +74,55 @@ function sameJson(left, right) { return JSON.stringify(left) === JSON.stringify(
 
 function isPlainObject(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 
+function assertObjectKeys(value, allowed, label) {
+  if (!isPlainObject(value) || Object.keys(value).some((key) => !allowed.includes(key))) throw new Error(`${label} contains unknown fields or is not an object.`);
+}
+
+function validateOptionalStringArray(value, label) {
+  if (value !== undefined && value !== null && (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))) {
+    throw new Error(`${label} must be an array of strings or null.`);
+  }
+}
+
+function validateFileSystemPath(value) {
+  if (!isPlainObject(value) || !["path", "glob_pattern", "special"].includes(value.type)) throw new Error("Permission file-system entries must contain a valid path type.");
+  if (value.type === "path" && (typeof value.path !== "string" || Object.keys(value).some((key) => !["type", "path"].includes(key)))) {
+    throw new Error("Permission path entries must contain a string path.");
+  }
+  if (value.type === "glob_pattern" && (typeof value.pattern !== "string" || Object.keys(value).some((key) => !["type", "pattern"].includes(key)))) {
+    throw new Error("Permission glob entries must contain a string pattern.");
+  }
+  if (value.type === "special" && (!isPlainObject(value.value) || typeof value.value.kind !== "string" || Object.keys(value).some((key) => !["type", "value"].includes(key)))) {
+    throw new Error("Permission special entries must contain a valid special path.");
+  }
+}
+
+function validateGrantedPermissions(value) {
+  assertObjectKeys(value, ["network", "fileSystem"], "Permission grants");
+  if (value.network !== undefined && value.network !== null) {
+    assertObjectKeys(value.network, ["enabled"], "Network permission");
+    if (value.network.enabled !== undefined && value.network.enabled !== null && typeof value.network.enabled !== "boolean") {
+      throw new Error("Network permission enabled must be boolean or null.");
+    }
+  }
+  if (value.fileSystem !== undefined && value.fileSystem !== null) {
+    assertObjectKeys(value.fileSystem, ["read", "write", "globScanMaxDepth", "entries"], "File-system permission");
+    validateOptionalStringArray(value.fileSystem.read, "File-system read roots");
+    validateOptionalStringArray(value.fileSystem.write, "File-system write roots");
+    if (value.fileSystem.globScanMaxDepth !== undefined && (!Number.isInteger(value.fileSystem.globScanMaxDepth) || value.fileSystem.globScanMaxDepth < 1)) {
+      throw new Error("File-system globScanMaxDepth must be a positive integer.");
+    }
+    if (value.fileSystem.entries !== undefined && (!Array.isArray(value.fileSystem.entries) || value.fileSystem.entries.some((entry) => {
+      try {
+        assertObjectKeys(entry, ["path", "access"], "File-system permission entry");
+        if (!["read", "write", "deny"].includes(entry.access)) throw new Error("invalid access");
+        validateFileSystemPath(entry.path);
+        return false;
+      } catch { return true; }
+    }))) throw new Error("File-system permission entries are invalid.");
+  }
+}
+
 function validateRequestResult(record, result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Request resolution must be a JSON object.");
   if (record.method === "item/commandExecution/requestApproval" || record.method === "item/fileChange/requestApproval") {
@@ -69,19 +130,23 @@ function validateRequestResult(record, result) {
       throw new Error("Approval decision must exactly match one of the request's available decisions.");
     }
   } else if (record.method === "item/permissions/requestApproval") {
-    if (!isPlainObject(result.permissions) || !["turn", "session"].includes(result.scope ?? "turn")) throw new Error("Permission approval requires permissions and a turn/session scope.");
+    if (!isPlainObject(result.permissions) || (result.scope !== undefined && !["turn", "session"].includes(result.scope))) throw new Error("Permission approval requires permissions and a turn/session scope.");
     if (Object.keys(result).some((key) => !["permissions", "scope", "strictAutoReview"].includes(key))) throw new Error("Permission approval contains unknown fields.");
-    if (Object.keys(result.permissions).some((key) => !["network", "fileSystem"].includes(key))) throw new Error("Permission approval contains unknown permission fields.");
-    if (result.strictAutoReview !== undefined && typeof result.strictAutoReview !== "boolean") throw new Error("strictAutoReview must be boolean.");
+    validateGrantedPermissions(result.permissions);
+    if (result.strictAutoReview !== undefined && result.strictAutoReview !== null && typeof result.strictAutoReview !== "boolean") throw new Error("strictAutoReview must be boolean.");
   } else if (record.method === "item/tool/requestUserInput") {
     if (!result.answers || typeof result.answers !== "object" || Array.isArray(result.answers)) throw new Error("User-input resolution must contain an answers object.");
+    if (Object.keys(result).some((key) => key !== "answers")) throw new Error("User-input resolution contains unknown fields.");
     for (const answer of Object.values(result.answers)) {
-      if (!isPlainObject(answer) || !Array.isArray(answer.answers) || answer.answers.some((entry) => typeof entry !== "string")) throw new Error("Each user-input answer must contain an array of strings.");
+      if (!isPlainObject(answer) || Object.keys(answer).some((key) => key !== "answers") || !Array.isArray(answer.answers) || answer.answers.some((entry) => typeof entry !== "string")) throw new Error("Each user-input answer must contain an array of strings.");
     }
   } else if (record.method === "mcpServer/elicitation/request") {
     if (!record.allowedDecisions.includes(result.action)) throw new Error(`Elicitation action must be one of: ${record.allowedDecisions.join(", ")}.`);
     if (Object.keys(result).some((key) => !["action", "content", "_meta"].includes(key))) throw new Error("Elicitation response contains unknown fields.");
-    if (result.action === "accept" && !isPlainObject(result.content)) throw new Error("Accepted elicitation requires structured content.");
+    if (!("content" in result) || !("_meta" in result)) throw new Error("Elicitation response must include content and _meta.");
+    if (result.action === "accept" && record.payload.mode !== "url" && !isPlainObject(result.content)) throw new Error("Accepted form elicitation requires structured content.");
+    if (result.action === "accept" && record.payload.mode === "url" && result.content !== null) throw new Error("Accepted URL elicitation must not include form content.");
+    if (result.action !== "accept" && result.content !== null) throw new Error("Declined or cancelled elicitation must not include content.");
   }
 }
 
@@ -271,6 +336,14 @@ export class WorkerCoordinator {
             worker.reviewBinding.controllerRuling = controllerRuling;
           }
         });
+        const updated = this.store.load().reviews[reviewId];
+        if (updated.reportFile && updated.orchestrationId && fs.existsSync(updated.reportFile)) {
+          const expectedReport = this.store.artifactPath(updated.orchestrationId, `reviews/${reviewId}/report.json`);
+          if (updated.reportFile === expectedReport) {
+            const report = JSON.parse(fs.readFileSync(updated.reportFile, "utf8"));
+            this.store.writeArtifact(updated.orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...report, controllerRuling, gate: ruledGate }, null, 2)}\n`);
+          }
+        }
         result = this.store.load().reviews[reviewId];
         break;
       }
@@ -530,10 +603,10 @@ export class WorkerCoordinator {
         reviewId,
         passId: item.passId
       });
-      passReviews.push(executed.review);
+      passReviews.push({ passId: item.passId, paths: item.paths ?? [], packageHash: item.hash, review: executed.review });
       this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/${item.passId}.json`, `${JSON.stringify(executed.review, null, 2)}\n`);
     }
-    let review = passReviews[0];
+    let review = passReviews[0].review;
     let finalWorker = null;
     if (passReviews.length > 1) {
       const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify({ coverageMap: reviewPackage.coverageMap, passReviews }, null, 2)}\n`);
@@ -563,7 +636,7 @@ export class WorkerCoordinator {
     };
     const reportFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, gate, packageHash: reviewPackage.hash, contextBudget }, null, 2)}\n`);
     const result = {
-      id: reviewId, status: "completed", reviewedWorkerId: params.workerId ?? null, workerId: finalWorker?.id ?? reviewWorkerId(reviewId, "p1"),
+      id: reviewId, orchestrationId, status: "completed", reviewedWorkerId: params.workerId ?? null, workerId: finalWorker?.id ?? reviewWorkerId(reviewId, "p1"),
       threadId: finalWorker?.thread.id ?? this.status(reviewWorkerId(reviewId, "p1")).thread.id,
       specVerdict: review.specVerdict, qualityVerdict: review.qualityVerdict,
       findings: review.findings, summary: review.summary, gate, packageFile,
@@ -674,7 +747,7 @@ export class WorkerCoordinator {
     const record = worker.pendingRequest;
     if (!record || record.id !== requestId || record.status !== "pending") throw new Error(`Request ${requestId} is stale.`);
     if (Date.parse(record.expiresAt) <= Date.now()) throw new Error(`Request ${requestId} has expired.`);
-    if (record.threadId !== worker.thread.id || record.turnId !== worker.turn?.id) throw new Error(`Request ${requestId} no longer matches the active thread and turn.`);
+    if (record.threadId !== worker.thread.id || (record.turnId !== null && record.turnId !== worker.turn?.id)) throw new Error(`Request ${requestId} no longer matches the active thread and turn.`);
     validateRequestResult(record, result);
     const canResume = this.activeTurns < this.maxConcurrent;
     const response = { requestId, status: canResume ? "resolved" : "queued" };
@@ -687,13 +760,17 @@ export class WorkerCoordinator {
   #completeResolution({ requestId, pending, result }) {
     pending.client.respondToServerRequest(pending.serverRequestId, result);
     this.pendingRequests.delete(requestId);
+    let resumedTurn = false;
     this.store.transaction((state) => {
       const worker = state.workers[pending.workerId];
       worker.pendingRequest = { ...worker.pendingRequest, status: "resolved", resolvedAt: nowIso() };
-      worker.turn.status = "running";
-      worker.turn.slotHeld = true;
+      if (worker.turn) {
+        worker.turn.status = "running";
+        worker.turn.slotHeld = true;
+        resumedTurn = true;
+      }
     });
-    this.activeTurns += 1;
+    if (resumedTurn) this.activeTurns += 1;
   }
 
   async stop(workerId) {
@@ -865,9 +942,11 @@ export class WorkerCoordinator {
     const requestId = `req-${randomUUID()}`;
     const worker = this.status(workerId);
     const threadId = message.params?.threadId ?? worker.thread.id;
-    const turnId = message.params?.turnId ?? worker.turn?.id ?? null;
+    const turnId = message.params?.turnId === undefined ? (worker.turn?.id ?? null) : message.params.turnId;
     if (worker.role === "sol" && isApproval) throw new Error("Sol review workers cannot request mutation approval.");
-    if (threadId !== worker.thread.id || !turnId || turnId !== worker.turn?.id) throw new Error("Server request does not match the active worker thread and turn.");
+    if (threadId !== worker.thread.id || (message.method !== "mcpServer/elicitation/request" && (!turnId || turnId !== worker.turn?.id)) || (message.method === "mcpServer/elicitation/request" && turnId !== null && turnId !== worker.turn?.id)) {
+      throw new Error("Server request does not match the active worker thread and turn.");
+    }
     const payload = sanitizeRequestValue(message.params ?? {});
     const record = {
       id: requestId, status: "pending", method: message.method,
@@ -880,12 +959,15 @@ export class WorkerCoordinator {
       createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
     };
     this.pendingRequests.set(requestId, { workerId, client: this.clients.get(workerId), serverRequestId: message.id });
+    const held = worker.turn?.slotHeld === true;
     this.store.transaction((state) => {
       state.workers[workerId].pendingRequest = record;
-      state.workers[workerId].turn.status = isApproval ? "waiting-approval" : "waiting-input";
-      state.workers[workerId].turn.slotHeld = false;
+      if (state.workers[workerId].turn) {
+        state.workers[workerId].turn.status = isApproval ? "waiting-approval" : "waiting-input";
+        state.workers[workerId].turn.slotHeld = false;
+      }
     });
-    this.activeTurns = Math.max(0, this.activeTurns - 1);
+    if (held) this.activeTurns = Math.max(0, this.activeTurns - 1);
     this.#notifyWaiters(workerId);
     void this.#pump();
   }
