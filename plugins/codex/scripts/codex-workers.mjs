@@ -5,6 +5,7 @@ import process from "node:process";
 import { assertSafeId, resolveRepositoryIdentity } from "./lib/worker-protocol.mjs";
 import {
   ensureCoordinatorSession,
+  restartCoordinatorSession,
   sendCoordinatorRequest,
   shutdownCoordinatorSession
 } from "./lib/worker-coordinator-lifecycle.mjs";
@@ -46,18 +47,23 @@ async function main() {
   if (group === "coordinator" && action === "shutdown") {
     return shutdownCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA });
   }
+  if (group === "coordinator" && action === "restart") {
+    return restartCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA, env: process.env });
+  }
 
   let operation;
   let params = {};
   if (group === "coordinator" && action === "status") {
     operation = "coordinator.status";
   } else if (group === "integration") {
-    if (!["commit", "apply"].includes(action)) throw new Error(`Unknown integration operation: ${action}.`);
+    if (!["commit", "apply", "rule"].includes(action)) throw new Error(`Unknown integration operation: ${action}.`);
     operation = `integration.${action}`;
     params.workerId = assertSafeId(required(options, "worker"), "worker");
     if (action === "commit") {
       params.message = required(options, "message");
       params.allowedPaths = options["allowed-path"];
+    } else if (action === "rule") {
+      params.reason = required(options, "reason");
     } else {
       params.expectedHead = required(options, "expected-head");
     }
@@ -125,7 +131,7 @@ async function main() {
     requestId,
     idempotencyKey: options["idempotency-key"] ?? requestId,
     timeoutMs: action === "wait"
-      ? (params.timeoutMs || 30000) + 1000
+      ? (params.timeoutMs > 0 ? params.timeoutMs + 1000 : 0)
       : operation === "review.start" ? 31 * 60 * 1000 : 10000
   });
 }

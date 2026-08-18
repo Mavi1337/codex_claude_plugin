@@ -9,6 +9,7 @@ import {
   applyReviewedCommits,
   commitTaskWorktree,
   createTaskWorktree,
+  inspectTaskWorktree,
   restoreTaskWorktree,
   rollbackTaskWorktreeCreation
 } from "./worker-worktree.mjs";
@@ -150,6 +151,21 @@ function validateRequestResult(record, result) {
   }
 }
 
+// A task worktree is created from a commit, so anything the integration checkout only holds
+// untracked, ignored, or uncommitted — `.venv`, `.env`, generated data files — is simply absent
+// there. Report it at start so a brief can carry absolute paths instead of failing mid-turn.
+const MAX_REPORTED_ABSENT_INPUTS = 50;
+
+function absentWorktreeInputs(repoRoot) {
+  try {
+    const { paths, ignored } = inspectTaskWorktree(repoRoot);
+    const all = [...new Set([...paths, ...ignored])].sort();
+    return { count: all.length, paths: all.slice(0, MAX_REPORTED_ABSENT_INPUTS), truncated: all.length > MAX_REPORTED_ABSENT_INPUTS };
+  } catch {
+    return { count: 0, paths: [], truncated: false };
+  }
+}
+
 function snapshotRequirementFiles(store, orchestrationId, workerId, repoRoot, requirementPaths = []) {
   return requirementPaths.map((entry, index) => {
     const absolute = path.resolve(repoRoot, String(entry));
@@ -287,20 +303,50 @@ export class WorkerCoordinator {
         });
         break;
       }
+      case "integration.rule": {
+        const worker = this.status(params.workerId);
+        if (worker.role !== "luna") throw new Error("Only Luna implementation workers carry integrable commits.");
+        if (!worker.headCommit || !worker.tree) throw new Error("A controller ruling requires a committed task worktree.");
+        const reason = String(params.reason ?? "").trim();
+        if (!reason) throw new Error("Controller ruling requires a reason.");
+        const controllerRuling = { waive: true, reason, recordedAt: nowIso() };
+        this.store.transaction((state) => {
+          const record = state.workers[params.workerId];
+          record.reviewGate = "pass-with-ruling";
+          record.reviewBinding = {
+            kind: "controller-ruling",
+            gate: "pass-with-ruling",
+            reviewId: null,
+            baseCommit: record.baseCommit,
+            headCommit: record.headCommit,
+            tree: record.tree,
+            controllerRuling
+          };
+          state.controllerRulings ??= [];
+          state.controllerRulings.push({
+            id: `ruling-${randomUUID()}`, workerId: record.id, orchestrationId: record.orchestrationId,
+            baseCommit: record.baseCommit, headCommit: record.headCommit, tree: record.tree, ...controllerRuling
+          });
+        });
+        result = this.status(params.workerId).reviewBinding;
+        break;
+      }
       case "integration.apply": {
         const worker = this.status(params.workerId);
         const binding = worker.reviewBinding;
         if (!["pass", "pass-with-ruling"].includes(worker.reviewGate) || worker.reviewGate !== binding?.gate) {
-          throw new Error("Worker changes have not passed an exact Sol review binding.");
+          throw new Error("Worker changes have not passed an exact Sol review or controller ruling binding.");
         }
         if (binding.baseCommit !== worker.baseCommit || binding.headCommit !== worker.headCommit || binding.tree !== worker.tree) {
-          throw new Error("Worker Git facts no longer match the passing Sol review binding.");
+          throw new Error("Worker Git facts no longer match the passing integration binding.");
         }
-        if (binding.reviewTarget?.mode !== "committed" || binding.reviewTarget.base !== binding.baseCommit || binding.reviewTarget.head !== binding.headCommit) {
-          throw new Error("The Sol review target does not match the bound worker commit range.");
-        }
-        if (!binding.packageFile || !fs.existsSync(binding.packageFile) || sha256(fs.readFileSync(binding.packageFile)) !== binding.packageHash) {
-          throw new Error("The immutable Sol review package no longer matches its recorded hash.");
+        if (binding.kind !== "controller-ruling") {
+          if (binding.reviewTarget?.mode !== "committed" || binding.reviewTarget.base !== binding.baseCommit || binding.reviewTarget.head !== binding.headCommit) {
+            throw new Error("The Sol review target does not match the bound worker commit range.");
+          }
+          if (!binding.packageFile || !fs.existsSync(binding.packageFile) || sha256(fs.readFileSync(binding.packageFile)) !== binding.packageHash) {
+            throw new Error("The immutable Sol review package no longer matches its recorded hash.");
+          }
         }
         result = this.#withIntegrationLease("apply", worker.id, () => applyReviewedCommits({
           integrationCwd: worker.integrationCwd,
@@ -419,7 +465,9 @@ export class WorkerCoordinator {
     }
     let workerCwd = options.workerCwd ?? options.cwd;
     let worktree = null;
+    let absentInputs = existing?.absentInputs ?? { count: 0, paths: [], truncated: false };
     if (role === "luna" && options.isolated !== false) {
+      absentInputs = absentWorktreeInputs(options.cwd);
       worktree = createTaskWorktree({
         repoRoot: options.cwd,
         workerId,
@@ -461,7 +509,7 @@ export class WorkerCoordinator {
       supervisorStatus: "online", thread: { id: response.thread.id, status: "ready" },
       headCommit: existing?.headCommit ?? null, tree: existing?.tree ?? null,
       assignmentPaths: options.allowedPaths?.map(String).sort() ?? existing?.assignmentPaths ?? [],
-      requirementFiles,
+      requirementFiles, absentInputs,
       turn: null, pendingRequest: null, createdAt: existing?.createdAt ?? nowIso(), updatedAt: nowIso()
     };
     this.clients.set(workerId, client);
@@ -716,13 +764,21 @@ export class WorkerCoordinator {
     }
   }
 
+  // `turnError` is a top-level mirror of `turn.error` so a failed turn is visible to a controller
+  // reading the head of a `worker wait`/`worker status` payload rather than only deep inside it.
   status(workerId) {
     const worker = this.store.load().workers[assertSafeId(workerId, "workerId")];
     if (!worker) throw new Error(`Unknown worker ${workerId}.`);
-    return structuredClone(worker);
+    const clone = structuredClone(worker);
+    return { ...clone, turnError: clone.turn?.error ?? null };
   }
 
-  list() { return Object.values(this.store.load().workers).map((worker) => structuredClone(worker)); }
+  list() {
+    return Object.values(this.store.load().workers).map((worker) => {
+      const clone = structuredClone(worker);
+      return { ...clone, turnError: clone.turn?.error ?? null };
+    });
+  }
 
   async wait(workerId, timeoutMs = 0) {
     const current = this.status(workerId);

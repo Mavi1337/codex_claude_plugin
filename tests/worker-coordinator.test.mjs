@@ -398,7 +398,7 @@ test("an in-flight H1 review cannot bind or integrate a later H2 commit", async 
   assert.equal(coordinator.status(worker.id).reviewBinding, null);
   await assert.rejects(
     () => coordinator.dispatch("integration.apply", { workerId: worker.id, expectedHead: worker.baseCommit }, "apply-race"),
-    /review binding/i
+    /have not passed an exact Sol review or controller ruling binding/i
   );
 });
 
@@ -439,4 +439,118 @@ test("coordinator restart reconciles a running review and permits explicit retry
   assert.equal(retried.status, "running");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(second.store.load().idempotency["review-new-key"].status, "completed");
+});
+
+async function committedLunaWorker(workerId) {
+  const cwd = makeTempDir("coordinator-git-");
+  const dataRoot = makeTempDir("coordinator-data-");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "one\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  const coordinator = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => new FakeClient() });
+  const worker = await coordinator.dispatch("worker.start", {
+    workerId, orchestrationId: "orch-1", cwd, role: "luna", allowedPaths: ["app.js"]
+  }, `start-${workerId}`);
+  coordinator.store.transaction((state) => {
+    state.workers[worker.id].turn = { id: "turn-done", status: "completed" };
+    state.workers[worker.id].result = { status: "completed" };
+  });
+  fs.writeFileSync(path.join(worker.cwd, "app.js"), "two\n");
+  const commit = await coordinator.dispatch("integration.commit", {
+    workerId, message: "task: change app", allowedPaths: ["app.js"]
+  }, `commit-${workerId}`);
+  return { coordinator, cwd, worker, commit };
+}
+
+test("a recorded controller ruling integrates a commit with no Sol review", async () => {
+  const { coordinator, worker, commit } = await committedLunaWorker("luna-ruled");
+  const binding = await coordinator.dispatch("integration.rule", {
+    workerId: worker.id, reason: "Sol reviews disabled for this lane by the operator."
+  }, "rule-1");
+  assert.equal(binding.kind, "controller-ruling");
+  assert.equal(binding.gate, "pass-with-ruling");
+  assert.equal(binding.headCommit, commit.commit);
+  assert.match(coordinator.store.load().controllerRulings[0].reason, /Sol reviews disabled/);
+
+  const applied = await coordinator.dispatch("integration.apply", {
+    workerId: worker.id, expectedHead: worker.baseCommit
+  }, "apply-ruled");
+  assert.deepEqual(applied.commits, [commit.commit]);
+});
+
+test("a controller ruling requires a reason and a committed worktree", async () => {
+  const { coordinator, worker } = await committedLunaWorker("luna-ruled-bad");
+  await assert.rejects(
+    () => coordinator.dispatch("integration.rule", { workerId: worker.id, reason: "   " }, "rule-blank"),
+    /requires a reason/i
+  );
+  coordinator.store.transaction((state) => { state.workers[worker.id].headCommit = null; });
+  await assert.rejects(
+    () => coordinator.dispatch("integration.rule", { workerId: worker.id, reason: "why" }, "rule-uncommitted"),
+    /requires a committed task worktree/i
+  );
+});
+
+test("a later commit invalidates a controller ruling just as it invalidates a review", async () => {
+  const { coordinator, worker } = await committedLunaWorker("luna-ruled-stale");
+  await coordinator.dispatch("integration.rule", { workerId: worker.id, reason: "operator ruling" }, "rule-stale");
+  fs.writeFileSync(path.join(worker.cwd, "app.js"), "three\n");
+  coordinator.store.transaction((state) => {
+    state.workers[worker.id].turn = { id: "turn-done-2", status: "completed" };
+    state.workers[worker.id].result = { status: "completed" };
+  });
+  await coordinator.dispatch("integration.commit", {
+    workerId: worker.id, message: "second", allowedPaths: ["app.js"]
+  }, "commit-stale-second");
+
+  assert.equal(coordinator.status(worker.id).reviewGate, null);
+  await assert.rejects(
+    () => coordinator.dispatch("integration.apply", { workerId: worker.id, expectedHead: worker.baseCommit }, "apply-stale-ruling"),
+    /have not passed/i
+  );
+});
+
+test("worker start reports inputs a fresh task worktree will not carry", async () => {
+  const cwd = makeTempDir("coordinator-git-");
+  const dataRoot = makeTempDir("coordinator-data-");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "one\n");
+  fs.writeFileSync(path.join(cwd, ".gitignore"), ".venv/\n");
+  run("git", ["add", "app.js", ".gitignore"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  fs.mkdirSync(path.join(cwd, ".venv"));
+  fs.writeFileSync(path.join(cwd, ".venv", "pyvenv.cfg"), "home = /usr\n");
+  fs.writeFileSync(path.join(cwd, "scratch.csv"), "a,b\n");
+
+  const coordinator = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => new FakeClient() });
+  const worker = await coordinator.dispatch("worker.start", {
+    workerId: "luna-inputs", orchestrationId: "orch-1", cwd, role: "luna", allowedPaths: ["app.js"]
+  }, "start-inputs");
+  assert.ok(worker.absentInputs.paths.includes("scratch.csv"));
+  assert.ok(worker.absentInputs.paths.some((entry) => entry.startsWith(".venv")));
+  assert.equal(fs.existsSync(path.join(worker.cwd, "scratch.csv")), false);
+});
+
+test("a failed turn surfaces its error at the head of the worker payload", async () => {
+  const cwd = makeTempDir("coordinator-");
+  const dataRoot = makeTempDir("coordinator-data-");
+  initGitRepo(cwd);
+  let client;
+  const coordinator = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => (client = new FakeClient()) });
+  await coordinator.startWorker({ workerId: "luna-failed", orchestrationId: "orch-1", cwd, role: "luna", isolated: false });
+  await coordinator.send("luna-failed", "work", "send-failed");
+  await new Promise((resolve) => setImmediate(resolve));
+  const entry = client.startedTurns[0];
+  client.notifications?.({
+    method: "turn/completed",
+    params: { threadId: entry.params.threadId, turn: { ...entry.turn, status: "failed", error: { message: "invalid_json_schema" } } }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const worker = coordinator.status("luna-failed");
+  assert.equal(worker.turn.status, "failed");
+  assert.match(worker.turnError, /invalid_json_schema/);
+  assert.equal(worker.result, undefined);
+  assert.match(coordinator.list().find((entry) => entry.id === "luna-failed").turnError, /invalid_json_schema/);
 });
