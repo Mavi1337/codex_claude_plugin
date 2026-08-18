@@ -276,6 +276,7 @@ export class WorkerCoordinator {
       }
       case "coordinator.status": result = {
         status: "online", repositoryId: this.store.identity.repositoryId,
+        coordinatorPid: process.pid, integrationCwd: this.cwd,
         activeTurns: this.activeTurns, queuedTurns: this.store.load().queue.length,
         workerCount: this.list().length, maxConcurrent: this.maxConcurrent
       }; break;

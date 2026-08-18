@@ -80,6 +80,7 @@ test("simultaneous coordinator discovery publishes one live owner", async (t) =>
   assert.equal(first.pid, second.pid);
   assert.equal(first.tokenFile, second.tokenFile);
   fs.writeFileSync(first.metadataFile, "{corrupt", "utf8");
+  fs.writeFileSync(path.join(first.store.rootDir, "coordinator-owner.lock", "owner.json"), "{corrupt", "utf8");
   const recovered = await ensureCoordinatorSession(repo, { dataRoot, env });
   assert.equal(recovered.pid, first.pid);
   assert.equal(fs.existsSync(parseBrokerEndpoint(recovered.endpoint).path), true);

@@ -91,6 +91,11 @@ async function sessionIsReady(session) {
   } catch { return false; }
 }
 
+async function probeCoordinator(session) {
+  try { return await sendCoordinatorRequest(session, "coordinator.status", {}, { timeoutMs: 1000 }); }
+  catch { return null; }
+}
+
 function processIsAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
@@ -151,6 +156,25 @@ export async function ensureCoordinatorSession(cwd, options = {}) {
     const loaded = loadCoordinatorSession(cwd, options);
     const owner = store.readOwnership();
     if (loaded && ownerMatchesProcess(owner) && owner.pid === loaded.pid && await sessionIsReady(loaded)) return loaded;
+    if (fs.existsSync(paths.tokenFile)) {
+      const discovered = { version: 1, repositoryId: store.identity.repositoryId, endpoint: paths.endpoint, ...paths, store };
+      const probe = await probeCoordinator(discovered);
+      const liveIdentity = readProcessIdentity(probe?.result?.coordinatorPid);
+      if (probe?.result?.repositoryId === store.identity.repositoryId && liveIdentity) {
+        const metadata = {
+          version: 1,
+          repositoryId: store.identity.repositoryId,
+          endpoint: paths.endpoint,
+          pid: liveIdentity.pid,
+          executable: liveIdentity.executable,
+          processStartIdentity: liveIdentity.startIdentity,
+          startedAt: owner?.acquiredAt ?? new Date().toISOString()
+        };
+        writePrivate(path.join(store.rootDir, "coordinator-owner.lock", "owner.json"), `${JSON.stringify({ ...liveIdentity, acquiredAt: metadata.startedAt })}\n`);
+        writePrivate(paths.metadataFile, `${JSON.stringify(metadata, null, 2)}\n`);
+        return { ...metadata, ...paths, store };
+      }
+    }
     if (ownerMatchesProcess(owner)) {
       const recovered = {
         version: 1,
