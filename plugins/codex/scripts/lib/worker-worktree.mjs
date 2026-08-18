@@ -16,6 +16,11 @@ function fullOid(cwd, ref) {
   return gitChecked(cwd, ["rev-parse", "--verify", `${ref}^{commit}`]).stdout.trim();
 }
 
+function canonicalGitPath(cwd, argument) {
+  const value = gitChecked(cwd, ["rev-parse", argument]).stdout.trim();
+  return fs.realpathSync(path.resolve(cwd, value));
+}
+
 function statusPaths(cwd) {
   const fields = gitChecked(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.split("\0");
   const paths = [];
@@ -41,7 +46,32 @@ export function createTaskWorktree({ repoRoot, workerId, base = "HEAD", worktree
   if (fs.existsSync(worktree)) throw new Error(`Task worktree already exists: ${worktree}.`);
   const branch = `codex-worker/${workerId}`;
   gitChecked(repoRoot, ["worktree", "add", "-b", branch, worktree, baseCommit]);
-  return { workerId, branch, worktree, base: baseCommit };
+  return {
+    workerId, branch, worktree, base: baseCommit,
+    commonDir: canonicalGitPath(worktree, "--git-common-dir"),
+    gitDir: canonicalGitPath(worktree, "--git-dir")
+  };
+}
+
+export function restoreTaskWorktree({ repoRoot, branch, worktree }) {
+  if (typeof branch !== "string" || !branch.startsWith("codex-worker/")) throw new Error("Invalid saved worker branch.");
+  const target = path.resolve(worktree);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  gitChecked(repoRoot, ["worktree", "prune", "--expire", "now"]);
+  gitChecked(repoRoot, ["worktree", "add", target, branch]);
+  return {
+    branch,
+    worktree: target,
+    base: fullOid(repoRoot, branch),
+    commonDir: canonicalGitPath(target, "--git-common-dir"),
+    gitDir: canonicalGitPath(target, "--git-dir")
+  };
+}
+
+export function rollbackTaskWorktreeCreation({ repoRoot, worktree, branch }) {
+  if (fs.existsSync(worktree) && inspectTaskWorktree(worktree).dirty) throw new Error("Refusing to roll back a partial worker start with material changes.");
+  if (fs.existsSync(worktree)) gitChecked(repoRoot, ["worktree", "remove", worktree]);
+  if (branch?.startsWith("codex-worker/")) gitChecked(repoRoot, ["branch", "-D", branch]);
 }
 
 export function inspectTaskWorktree(cwd) {
@@ -52,6 +82,20 @@ export function inspectTaskWorktree(cwd) {
 }
 
 export function commitTaskWorktree(cwd, options = {}) {
+  if (options.expected) {
+    const actual = {
+      commonDir: canonicalGitPath(cwd, "--git-common-dir"),
+      gitDir: canonicalGitPath(cwd, "--git-dir"),
+      branch: gitChecked(cwd, ["branch", "--show-current"]).stdout.trim()
+    };
+    if (actual.commonDir !== options.expected.commonDir || actual.gitDir !== options.expected.gitDir || actual.branch !== options.expected.branch) {
+      throw new Error("Task worktree repository, Git directory, or branch no longer matches its trusted assignment.");
+    }
+    const baseCommit = fullOid(cwd, options.expected.base);
+    if (git(cwd, ["merge-base", "--is-ancestor", baseCommit, "HEAD"]).status !== 0) {
+      throw new Error("Task worktree HEAD is no longer descended from its assigned base.");
+    }
+  }
   const paths = statusPaths(cwd);
   if (paths.length === 0) throw new Error("Task worktree has no changes to commit.");
   const allowed = options.allowedPaths ? new Set(options.allowedPaths.map(String)) : null;
@@ -77,12 +121,14 @@ export function commitTaskWorktree(cwd, options = {}) {
   return { commit, tree, paths: stagedPaths };
 }
 
-export function applyReviewedCommits({ integrationCwd, expectedHead, base, head }) {
+export function applyReviewedCommits({ integrationCwd, expectedHead, base, head, expectedTree }) {
   const actualHead = fullOid(integrationCwd, "HEAD");
   const expected = fullOid(integrationCwd, expectedHead);
   if (actualHead !== expected) throw new Error(`Integration expected HEAD ${expected}, found ${actualHead}.`);
   const baseCommit = fullOid(integrationCwd, base);
   const headCommit = fullOid(integrationCwd, head);
+  const headTree = gitChecked(integrationCwd, ["rev-parse", `${headCommit}^{tree}`]).stdout.trim();
+  if (expectedTree && headTree !== expectedTree) throw new Error("Reviewed task tree no longer matches its immutable review binding.");
   const ancestor = git(integrationCwd, ["merge-base", "--is-ancestor", baseCommit, headCommit]);
   if (ancestor.status !== 0) throw new Error("Reviewed task head is not a descendant of its recorded base.");
   const commits = gitChecked(integrationCwd, ["rev-list", "--reverse", `${baseCommit}..${headCommit}`]).stdout.trim().split("\n").filter(Boolean);
@@ -92,11 +138,13 @@ export function applyReviewedCommits({ integrationCwd, expectedHead, base, head 
     if (parents.length > 1) throw new Error(`Merge commit ${commit} is not supported.`);
   }
   try {
-    for (const commit of commits) {
-      gitChecked(integrationCwd, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "cherry-pick", commit]);
-    }
+    gitChecked(integrationCwd, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "cherry-pick", ...commits]);
   } catch (error) {
     git(integrationCwd, ["cherry-pick", "--abort"]);
+    const restoredHead = fullOid(integrationCwd, "HEAD");
+    if (restoredHead !== expected) {
+      throw new Error(`Reviewed commit integration failed and rollback did not restore ${expected}; found ${restoredHead}. Manual repair is required.`);
+    }
     throw new Error(`Reviewed commit integration failed and was aborted: ${error.message}`);
   }
   return { commits, head: fullOid(integrationCwd, "HEAD") };

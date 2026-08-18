@@ -1,9 +1,9 @@
 # Sol Review: Codex Worker Development Design
 
-**Reviewed:** 2026-08-18  
-**Design commit:** `99408bfcac1315618e5cbe4209473eb648e831af`  
-**Design:** `docs/superpowers/specs/2026-08-18-codex-worker-development-design.md`  
-**Review scope:** Specification completeness, internal consistency, feasibility, compatibility, security, concurrency, persistence, approval routing, context budgeting, testing, and upgrade risk.  
+**Reviewed:** 2026-08-18
+**Design commit:** `99408bfcac1315618e5cbe4209473eb648e831af`
+**Design:** `docs/superpowers/specs/2026-08-18-codex-worker-development-design.md`
+**Review scope:** Specification completeness, internal consistency, feasibility, compatibility, security, concurrency, persistence, approval routing, context budgeting, testing, and upgrade risk.
 **Method:** Static review of the design and the current `codex-plugin-cc` implementation, with protocol cross-checks against the local Codex source checkout at `a16863f870`.
 
 ## Executive assessment
@@ -332,4 +332,3 @@ These revisions should land in the design before a task-by-task implementation p
 - **Spec completeness:** changes-required
 - **Architecture quality:** changes-required
 - **Ready for implementation planning:** no
-

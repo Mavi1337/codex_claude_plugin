@@ -5,23 +5,37 @@ const QUALITY = new Set(["approve", "changes-required"]);
 const SEVERITY = new Set(["critical", "important", "minor"]);
 
 function stableId(reviewId, passId, finding) {
-  const normalized = JSON.stringify([reviewId, passId, finding.severity, finding.title, finding.evidence, finding.locations ?? []]);
+  const normalizedLocations = (finding.locations ?? []).map((location) => [location.path, location.line ?? null]).sort();
+  const normalized = JSON.stringify([reviewId, passId, finding.title.trim().toLowerCase(), finding.evidence.trim(), normalizedLocations]);
   return `SOL-${createHash("sha256").update(normalized).digest("hex").slice(0, 12).toUpperCase()}`;
 }
 
 export function validateSolReview(value, context = {}) {
-  if (!value || value.schemaVersion !== 1) throw new Error("Sol review must use schemaVersion 1.");
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.schemaVersion !== 1) throw new Error("Sol review must use schemaVersion 1.");
+  const topKeys = new Set(["schemaVersion", "specVerdict", "qualityVerdict", "summary", "findings"]);
+  if (Object.keys(value).some((key) => !topKeys.has(key))) throw new Error("Sol review contains unknown top-level fields.");
   if (!SPEC.has(value.specVerdict)) throw new Error("Invalid Sol specification verdict.");
   if (!QUALITY.has(value.qualityVerdict)) throw new Error("Invalid Sol quality verdict.");
   if (typeof value.summary !== "string" || !Array.isArray(value.findings)) throw new Error("Sol review summary and findings are required.");
   const findings = value.findings.map((finding) => {
+    if (!finding || typeof finding !== "object" || Array.isArray(finding)) throw new Error("Invalid Sol finding object.");
+    const findingKeys = new Set(["id", "severity", "title", "evidence", "impact", "recommendation", "confidence", "locations", "supersedes", "duplicateOf"]);
+    if (Object.keys(finding).some((key) => !findingKeys.has(key))) throw new Error("Sol finding contains unknown fields.");
     if (!SEVERITY.has(finding.severity) || !finding.title || !finding.evidence || !finding.impact || !finding.recommendation) {
       throw new Error("Invalid Sol finding fields.");
     }
     if (typeof finding.confidence !== "number" || finding.confidence < 0 || finding.confidence > 1) throw new Error("Finding confidence must be between zero and one.");
     const locations = finding.locations ?? [];
     if (!Array.isArray(locations)) throw new Error("Finding locations must be an array.");
-    return { ...finding, id: finding.id ?? stableId(context.reviewId ?? "review", context.passId ?? "pass", finding), locations };
+    for (const location of locations) {
+      if (!location || typeof location !== "object" || Array.isArray(location) || typeof location.path !== "string" || !location.path || Object.keys(location).some((key) => !["path", "line"].includes(key))) {
+        throw new Error("Invalid Sol finding location.");
+      }
+      if (location.line !== undefined && location.line !== null && (!Number.isInteger(location.line) || location.line < 1)) throw new Error("Invalid Sol finding line.");
+    }
+    if (finding.supersedes !== undefined && (!Array.isArray(finding.supersedes) || finding.supersedes.some((id) => typeof id !== "string"))) throw new Error("Invalid Sol supersedes relationship.");
+    if (finding.duplicateOf !== undefined && finding.duplicateOf !== null && typeof finding.duplicateOf !== "string") throw new Error("Invalid Sol duplicate relationship.");
+    return { ...finding, id: stableId(context.reviewId ?? "review", context.passId ?? "pass", finding), locations };
   });
   return { ...value, findings };
 }

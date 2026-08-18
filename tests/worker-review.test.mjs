@@ -44,17 +44,31 @@ test("frozen review package remains immutable after the worktree changes", () =>
   assert.equal(frozen.manifest.some((entry) => entry.path === "new.txt" && entry.kind === "untracked"), true);
 });
 
-test("oversized packages partition by manifest entries without silent truncation", () => {
+test("oversized packages partition one large file into immutable bounded content", () => {
   const repo = repoWithHistory();
-  fs.writeFileSync(path.join(repo, "a.txt"), "a".repeat(200));
-  fs.writeFileSync(path.join(repo, "b.txt"), "b".repeat(200));
+  fs.writeFileSync(path.join(repo, "a.txt"), "a".repeat(20000));
   const target = resolveWorkerReviewTarget(repo, { worktree: true });
-  const frozen = freezeReviewPackage(repo, target, { maxInputTokens: 40 });
+  const frozen = freezeReviewPackage(repo, target, { maxInputTokens: 1000 });
   assert.ok(frozen.partitions.length >= 2);
-  assert.deepEqual(
-    [...new Set(frozen.partitions.flatMap((partition) => partition.paths))].sort(),
-    frozen.manifest.filter((entry) => entry.included).map((entry) => entry.path).sort()
-  );
+  assert.equal(frozen.partitions.every((partition) => partition.estimatedTokens <= 1000), true);
+  assert.equal(frozen.partitions.every((partition) => partition.content.includes(frozen.hash)), true);
+});
+
+test("audit roots recurse and committed file filters use the reviewed Git object", () => {
+  const repo = repoWithHistory();
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "a.js"), "committed\n");
+  run("git", ["add", "src/a.js"], { cwd: repo });
+  run("git", ["commit", "-m", "add source"], { cwd: repo });
+  const head = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+  const base = run("git", ["rev-parse", "HEAD~1"], { cwd: repo }).stdout.trim();
+  fs.writeFileSync(path.join(repo, "src", "a.js"), "working copy\n");
+
+  const audit = freezeReviewPackage(repo, resolveWorkerReviewTarget(repo, { auditPaths: ["src"] }));
+  assert.match(audit.content, /working copy/);
+  const committed = freezeReviewPackage(repo, resolveWorkerReviewTarget(repo, { range: `${base}..${head}`, files: ["src/a.js"] }));
+  assert.match(committed.content, /committed/);
+  assert.doesNotMatch(committed.content, /working copy/);
 });
 
 test("Sol review schema supports location-free findings and deterministic gates", () => {
@@ -69,4 +83,19 @@ test("Sol review schema supports location-free findings and deterministic gates"
   assert.equal(evaluateReviewGate(review).status, "block");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "approve", findings: [] }).status, "pass");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "changes-required" }).status, "block");
+});
+
+test("Sol validation rejects unknown fields and replaces model-provided finding IDs", () => {
+  const base = {
+    schemaVersion: 1,
+    specVerdict: "pass",
+    qualityVerdict: "approve",
+    summary: "ok",
+    findings: [{ id: "MODEL-ID", severity: "minor", title: "Title", evidence: "Evidence", impact: "Impact", recommendation: "Fix", confidence: 0.8, locations: [] }]
+  };
+  const validated = validateSolReview(base, { reviewId: "review-1", passId: "pass-1" });
+  assert.match(validated.findings[0].id, /^SOL-/);
+  assert.notEqual(validated.findings[0].id, "MODEL-ID");
+  assert.throws(() => validateSolReview({ ...base, surprise: true }), /unknown top-level/i);
+  assert.throws(() => validateSolReview({ ...base, findings: [{ ...base.findings[0], locationTypo: true }] }), /unknown fields/i);
 });

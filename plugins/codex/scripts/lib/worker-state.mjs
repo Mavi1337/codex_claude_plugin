@@ -14,6 +14,8 @@ function initialState(repositoryId) {
     workers: {},
     reviews: {},
     queue: [],
+    inFlightQueue: {},
+    recoveryQueue: [],
     idempotency: {},
     integrationLease: null,
     updatedAt: new Date(0).toISOString()
@@ -62,6 +64,16 @@ function durableWrite(file, source) {
   }
 }
 
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error?.code === "EPERM"; }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
 export function createWorkerStore(cwd, options = {}) {
   const identity = resolveRepositoryIdentity(cwd);
   const dataRoot = options.dataRoot ?? process.env.CLAUDE_PLUGIN_DATA ?? path.join(os.tmpdir(), "codex-companion");
@@ -69,6 +81,41 @@ export function createWorkerStore(cwd, options = {}) {
   const stateFile = path.join(rootDir, "state.json");
   const backupFile = `${stateFile}.bak`;
   const defaultValue = () => initialState(identity.repositoryId);
+
+  function acquireLock(name, options = {}) {
+    const lockDir = path.join(rootDir, `${name}.lock`);
+    const deadline = Date.now() + (options.waitMs ?? 0);
+    ensureOwnerDirectory(rootDir);
+    while (true) {
+      try {
+        fs.mkdirSync(lockDir, { mode: 0o700 });
+        durableWrite(path.join(lockDir, "owner.json"), `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`);
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          try {
+            const owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+            if (owner.pid !== process.pid) throw new Error(`Refusing to release ${name}; ownership changed.`);
+            fs.rmSync(lockDir, { recursive: true });
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        };
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        let owner = null;
+        try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")); } catch {}
+        const stat = fs.statSync(lockDir);
+        if ((!owner || !processIsAlive(owner.pid)) && Date.now() - stat.mtimeMs > 30000) {
+          fs.rmSync(lockDir, { recursive: true });
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error(`Worker repository is already owned by another live ${name} process.`);
+        sleepSync(10);
+      }
+    }
+  }
 
   function load() {
     if (!fs.existsSync(stateFile)) return defaultValue();
@@ -85,14 +132,17 @@ export function createWorkerStore(cwd, options = {}) {
   }
 
   function transaction(mutator) {
-    const value = load();
-    const expectedRevision = value.revision;
-    mutator(value);
-    const current = fs.existsSync(stateFile) ? load().revision : 0;
-    if (current !== expectedRevision) throw new Error("Worker state revision conflict.");
-    value.revision += 1;
-    value.updatedAt = new Date().toISOString();
-    return save(value);
+    const release = acquireLock("state-write", { waitMs: 2000 });
+    try {
+      const value = load();
+      const expectedRevision = value.revision;
+      mutator(value);
+      const current = fs.existsSync(stateFile) ? load().revision : 0;
+      if (current !== expectedRevision) throw new Error("Worker state revision conflict.");
+      value.revision += 1;
+      value.updatedAt = new Date().toISOString();
+      return save(value);
+    } finally { release(); }
   }
 
   function recoverBackup() {
@@ -120,5 +170,9 @@ export function createWorkerStore(cwd, options = {}) {
     return file;
   }
 
-  return { identity, rootDir, stateFile, backupFile, load, transaction, recoverBackup, artifactPath, writeArtifact };
+  return {
+    identity, rootDir, stateFile, backupFile, load, transaction, recoverBackup,
+    artifactPath, writeArtifact,
+    acquireOwnership: (name = "coordinator-owner") => acquireLock(name)
+  };
 }

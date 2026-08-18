@@ -1,10 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 
 import { CodexAppServerClient } from "./app-server.mjs";
 import { assertSafeId } from "./worker-protocol.mjs";
 import { createWorkerStore } from "./worker-state.mjs";
-import { applyReviewedCommits, commitTaskWorktree, createTaskWorktree } from "./worker-worktree.mjs";
+import {
+  applyReviewedCommits,
+  commitTaskWorktree,
+  createTaskWorktree,
+  restoreTaskWorktree,
+  rollbackTaskWorktreeCreation
+} from "./worker-worktree.mjs";
 import { resolveWorkerReviewTarget } from "./review-target.mjs";
 import { freezeReviewPackage } from "./review-package.mjs";
 import { evaluateReviewGate, validateSolReview, validateWorkerResult } from "./worker-review.mjs";
@@ -25,6 +31,37 @@ const APPROVAL_METHODS = new Set([
 
 function nowIso() { return new Date().toISOString(); }
 function turnInput(prompt) { return [{ type: "text", text: prompt, text_elements: [] }]; }
+function sha256(value) { return createHash("sha256").update(value).digest("hex"); }
+
+function sanitizeRequestValue(value, key = "", depth = 0) {
+  if (depth > 6) return "[truncated-depth]";
+  if (/token|secret|password|authorization|cookie/i.test(key)) return "[redacted]";
+  if (typeof value === "string") return value.length > 4096 ? `${value.slice(0, 4096)}…[truncated]` : value;
+  if (Array.isArray(value)) return value.slice(0, 100).map((entry) => sanitizeRequestValue(entry, key, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).slice(0, 100).map(([name, entry]) => [name, sanitizeRequestValue(entry, name, depth + 1)]));
+  }
+  return value;
+}
+
+function allowedRequestDecisions(method, params) {
+  const explicit = Array.isArray(params?.allowedDecisions) ? params.allowedDecisions.map(String) : null;
+  if (explicit?.length) return explicit;
+  if (APPROVAL_METHODS.has(method)) return ["accept", "decline", "cancel"];
+  if (method === "mcpServer/elicitation/request") return ["accept", "decline", "cancel"];
+  return [];
+}
+
+function validateRequestResult(record, result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Request resolution must be a JSON object.");
+  if (APPROVAL_METHODS.has(record.method)) {
+    if (!record.allowedDecisions.includes(result.decision)) throw new Error(`Approval decision must be one of: ${record.allowedDecisions.join(", ")}.`);
+  } else if (record.method === "item/tool/requestUserInput") {
+    if (!result.answers || typeof result.answers !== "object" || Array.isArray(result.answers)) throw new Error("User-input resolution must contain an answers object.");
+  } else if (record.method === "mcpServer/elicitation/request") {
+    if (!record.allowedDecisions.includes(result.action)) throw new Error(`Elicitation action must be one of: ${record.allowedDecisions.join(", ")}.`);
+  }
+}
 
 export class WorkerCoordinator {
   constructor(options) {
@@ -34,6 +71,8 @@ export class WorkerCoordinator {
     this.clientFactory = options.clientFactory ?? ((cwd, clientOptions) => CodexAppServerClient.connect(cwd, { ...clientOptions, disableBroker: true }));
     this.clients = new Map();
     this.pendingRequests = new Map();
+    this.pendingResolutions = [];
+    this.closingWorkers = new Set();
     this.waiters = new Map();
     this.activeTurns = 0;
     this.pumping = false;
@@ -51,7 +90,13 @@ export class WorkerCoordinator {
           }
           if (worker.pendingRequest?.status === "pending") worker.pendingRequest.status = "cancelled";
         }
+        state.recoveryQueue ??= [];
+        state.recoveryQueue.push(
+          ...state.queue.map((entry) => ({ ...entry, recoveryStatus: "indeterminate", recoveredAt: nowIso() })),
+          ...Object.values(state.inFlightQueue ?? {}).map((entry) => ({ ...entry, recoveryStatus: "indeterminate", recoveredAt: nowIso() }))
+        );
         state.queue = [];
+        state.inFlightQueue = {};
       });
     }
   }
@@ -60,6 +105,26 @@ export class WorkerCoordinator {
     assertSafeId(idempotencyKey, "idempotencyKey");
     const prior = this.store.load().idempotency[idempotencyKey];
     if (prior) return prior;
+    if (operation === "review.start") {
+      const reviewId = assertSafeId(params.reviewId, "reviewId");
+      const running = { id: reviewId, status: "running", startedAt: nowIso() };
+      this.store.transaction((state) => {
+        if (state.reviews[reviewId] && state.reviews[reviewId].status !== "failed") throw new Error(`Review ${reviewId} already exists.`);
+        state.reviews[reviewId] = running;
+        state.idempotency[idempotencyKey] = running;
+      });
+      try {
+        const completed = await this.startReview(params, idempotencyKey);
+        this.store.transaction((state) => { state.idempotency[idempotencyKey] = completed; });
+        return completed;
+      } catch (error) {
+        this.store.transaction((state) => {
+          state.reviews[reviewId] = { ...running, status: "failed", error: String(error.message ?? error), completedAt: nowIso() };
+          state.idempotency[idempotencyKey] = state.reviews[reviewId];
+        });
+        throw error;
+      }
+    }
     let result;
     switch (operation) {
       case "worker.start": result = await this.startWorker(params); break;
@@ -85,25 +150,51 @@ export class WorkerCoordinator {
       case "integration.commit": {
         const worker = this.status(params.workerId);
         if (worker.role !== "luna") throw new Error("Only Luna implementation workers have task worktrees to commit.");
-        result = commitTaskWorktree(worker.cwd, { message: params.message, allowedPaths: params.allowedPaths });
+        if (worker.turn?.status !== "completed" || !["completed", "completed_with_concerns"].includes(worker.result?.status)) {
+          throw new Error("integration.commit requires a terminal Luna turn with a validated implementation report.");
+        }
+        if (!Array.isArray(params.allowedPaths) || params.allowedPaths.length === 0) {
+          throw new Error("integration.commit requires explicit allowed paths from the task assignment.");
+        }
+        const assigned = [...(worker.assignmentPaths ?? [])].sort();
+        const requested = [...params.allowedPaths].map(String).sort();
+        if (!assigned.length || JSON.stringify(assigned) !== JSON.stringify(requested)) {
+          throw new Error("integration.commit allowed paths must exactly match the worker's runtime-owned task assignment.");
+        }
+        result = this.#withIntegrationLease("commit", worker.id, () => commitTaskWorktree(worker.cwd, {
+          message: params.message,
+          allowedPaths: params.allowedPaths,
+          expected: { commonDir: worker.commonDir, gitDir: worker.gitDir, branch: worker.branch, base: worker.baseCommit }
+        }));
         this.store.transaction((state) => {
           state.workers[params.workerId].headCommit = result.commit;
           state.workers[params.workerId].tree = result.tree;
+          state.workers[params.workerId].reviewGate = null;
+          state.workers[params.workerId].reviewBinding = null;
         });
         break;
       }
       case "integration.apply": {
         const worker = this.status(params.workerId);
-        if (worker.reviewGate !== "pass") throw new Error("Worker changes have not passed the Sol review gate.");
-        result = applyReviewedCommits({
+        const binding = worker.reviewBinding;
+        if (worker.reviewGate !== "pass" || binding?.gate !== "pass") {
+          throw new Error("Worker changes have not passed an exact Sol review binding.");
+        }
+        if (binding.baseCommit !== worker.baseCommit || binding.headCommit !== worker.headCommit || binding.tree !== worker.tree) {
+          throw new Error("Worker Git facts no longer match the passing Sol review binding.");
+        }
+        if (!binding.packageFile || !fs.existsSync(binding.packageFile) || sha256(fs.readFileSync(binding.packageFile)) !== binding.packageHash) {
+          throw new Error("The immutable Sol review package no longer matches its recorded hash.");
+        }
+        result = this.#withIntegrationLease("apply", worker.id, () => applyReviewedCommits({
           integrationCwd: worker.integrationCwd,
           expectedHead: params.expectedHead,
           base: worker.baseCommit,
-          head: worker.headCommit
-        });
+          head: worker.headCommit,
+          expectedTree: binding.tree
+        }));
         break;
       }
-      case "review.start": result = await this.startReview(params, idempotencyKey); break;
       case "review.status":
       case "review.result": {
         result = this.store.load().reviews?.[assertSafeId(params.reviewId, "reviewId")];
@@ -120,6 +211,36 @@ export class WorkerCoordinator {
     }
     this.store.transaction((state) => { state.idempotency[idempotencyKey] = result; });
     return result;
+  }
+
+  #withIntegrationLease(operation, workerId, callback) {
+    const token = randomUUID();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    this.store.transaction((state) => {
+      const existing = state.integrationLease;
+      if (existing && Date.parse(existing.expiresAt) > Date.now()) {
+        throw new Error(`Integration authority is leased by ${existing.operation} for worker ${existing.workerId}.`);
+      }
+      state.integrationLease = { token, operation, workerId, acquiredAt: nowIso(), expiresAt };
+    });
+    try { return callback(); }
+    catch (error) {
+      if (operation === "apply") {
+        this.store.transaction((state) => {
+          state.integrationConflicts ??= [];
+          state.integrationConflicts.push({
+            id: `conflict-${randomUUID()}`, workerId, operation,
+            error: String(error.message ?? error), recordedAt: nowIso()
+          });
+        });
+      }
+      throw error;
+    }
+    finally {
+      this.store.transaction((state) => {
+        if (state.integrationLease?.token === token) state.integrationLease = null;
+      });
+    }
   }
 
   async startWorker(options) {
@@ -157,24 +278,41 @@ export class WorkerCoordinator {
         worktreeRoot: options.worktreeRoot ?? this.store.artifactPath(orchestrationId, "worktrees")
       });
       workerCwd = worktree.worktree;
+    } else if (role === "luna" && options.threadId && !fs.existsSync(workerCwd) && existing?.branch) {
+      worktree = restoreTaskWorktree({ repoRoot: options.cwd, branch: existing.branch, worktree: workerCwd });
     }
     client.setNotificationHandler((message) => this.#handleNotification(workerId, message));
     client.setServerRequestHandler((message) => this.#handleServerRequest(workerId, message));
-    const response = options.threadId
-      ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: profile.config })
-      : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: profile.config });
+    let response;
+    try {
+      response = options.threadId
+        ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: profile.config })
+        : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: profile.config });
+    } catch (error) {
+      await client.close().catch(() => {});
+      if (worktree && !options.threadId) {
+        rollbackTaskWorktreeCreation({ repoRoot: options.cwd, worktree: worktree.worktree, branch: worktree.branch });
+      }
+      throw error;
+    }
     const record = {
       id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
       branch: worktree?.branch ?? existing?.branch ?? null,
-      baseCommit: worktree?.base ?? existing?.baseCommit ?? null,
+      commonDir: worktree?.commonDir ?? existing?.commonDir ?? null,
+      gitDir: worktree?.gitDir ?? existing?.gitDir ?? null,
+      baseCommit: existing?.baseCommit ?? worktree?.base ?? null,
       model: profile.model,
       effort: profile.effort, sandbox: profile.sandbox, approvalPolicy: profile.approvalPolicy,
       supervisorStatus: "online", thread: { id: response.thread.id, status: "ready" },
       headCommit: existing?.headCommit ?? null, tree: existing?.tree ?? null,
+      assignmentPaths: options.allowedPaths?.map(String).sort() ?? existing?.assignmentPaths ?? [],
       turn: null, pendingRequest: null, createdAt: existing?.createdAt ?? nowIso(), updatedAt: nowIso()
     };
     this.clients.set(workerId, client);
     this.store.transaction((state) => { state.workers[workerId] = record; });
+    if (client.exitPromise && typeof client.exitPromise.then === "function") {
+      void client.exitPromise.then((error) => this.#handleTransportExit(workerId, error));
+    }
     return record;
   }
 
@@ -198,9 +336,22 @@ export class WorkerCoordinator {
       id: `queue-${randomUUID()}`, workerId, prompt: rolePrompt, idempotencyKey,
       outputSchema: turnOptions.outputSchema ?? lunaSchema, queuedAt: nowIso()
     };
+    if (worker.role === "luna") {
+      const source = `${String(prompt).trim()}\n`;
+      const instructionFile = this.store.writeArtifact(worker.orchestrationId, `tasks/${worker.id}/instructions/${entry.id}.md`, source);
+      this.store.transaction((next) => {
+        const record = next.workers[workerId];
+        record.instructionFiles ??= [];
+        record.instructionFiles.push({ file: instructionFile, hash: sha256(source), queuedAt: entry.queuedAt });
+        if (!record.taskBriefFile) {
+          record.taskBriefFile = instructionFile;
+          record.taskBriefHash = sha256(source);
+        }
+      });
+    }
     this.store.transaction((next) => {
       next.queue.push(entry);
-      next.workers[workerId].turn = { id: null, status: "queued", queuedAt: entry.queuedAt };
+      next.workers[workerId].turn = { id: null, status: "queued", slotHeld: false, queuedAt: entry.queuedAt };
     });
     const started = await this.#pump();
     const result = started.has(entry.id) ? { workerId, status: "running" } : { workerId, status: "queued" };
@@ -220,16 +371,46 @@ export class WorkerCoordinator {
       ? { range: `${reviewedWorker.baseCommit}..${reviewedWorker.headCommit}` }
       : (params.target ?? {});
     const target = resolveWorkerReviewTarget(reviewCwd, targetOptions);
-    const reviewPackage = freezeReviewPackage(reviewCwd, target, { maxInputTokens: params.maxInputTokens ?? 190000 });
+    const maxInputTokens = params.maxInputTokens ?? 190000;
+    if (!Number.isInteger(maxInputTokens) || maxInputTokens < 64 || maxInputTokens > 190000) {
+      throw new Error("Review max-input-tokens must be an integer between 64 and 190000, preserving the 258K context reserves.");
+    }
+    let evidenceSections = [];
+    if (params.taskReview) {
+      if (!reviewedWorker) throw new Error("Task review requires an explicit Luna worker.");
+      if (!reviewedWorker.taskBriefFile || !fs.existsSync(reviewedWorker.taskBriefFile)) throw new Error("Task review is missing its canonical task brief.");
+      if (!reviewedWorker.reportFile || !fs.existsSync(reviewedWorker.reportFile) || !reviewedWorker.result) throw new Error("Task review is missing the validated Luna implementation report and test evidence.");
+      if (!Array.isArray(reviewedWorker.assignmentPaths) || reviewedWorker.assignmentPaths.length === 0) throw new Error("Task review is missing the runtime-owned path assignment.");
+      evidenceSections = [
+        {
+          title: "Binding task brief and follow-up instructions",
+          body: (reviewedWorker.instructionFiles ?? []).map((entry) => `### ${entry.hash}\n\n${fs.readFileSync(entry.file, "utf8")}`).join("\n")
+        },
+        { title: "Validated Luna implementation report, tests, and concerns", body: fs.readFileSync(reviewedWorker.reportFile, "utf8") },
+        {
+          title: "Binding runtime constraints",
+          body: JSON.stringify({
+            workerId: reviewedWorker.id, model: reviewedWorker.model, effort: reviewedWorker.effort,
+            sandbox: reviewedWorker.sandbox, approvalPolicy: reviewedWorker.approvalPolicy,
+            baseCommit: reviewedWorker.baseCommit, headCommit: reviewedWorker.headCommit,
+            tree: reviewedWorker.tree, allowedPaths: reviewedWorker.assignmentPaths,
+            taskBriefHash: reviewedWorker.taskBriefHash
+          }, null, 2)
+        }
+      ];
+    }
+    const reviewPackage = freezeReviewPackage(reviewCwd, target, {
+      maxInputTokens,
+      extraSections: evidenceSections
+    });
     const schema = JSON.parse(fs.readFileSync(SOL_SCHEMA_URL, "utf8"));
     const promptTemplate = fs.readFileSync(params.taskReview ? SOL_TASK_PROMPT_URL : SOL_BRANCH_PROMPT_URL, "utf8");
-    const maxInputTokens = params.maxInputTokens ?? 190000;
     const packageFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/package.md`, reviewPackage.content);
-    const packages = reviewPackage.partitions.length > 1
+    const packages = reviewPackage.requiresPartitioning
       ? reviewPackage.partitions.map((partition, index) => {
-          const scoped = freezeReviewPackage(reviewCwd, { ...target, paths: partition.paths }, { maxInputTokens });
-          const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/pass-${index + 1}.md`, scoped.content);
-          return { ...scoped, file, passId: `pass-${index + 1}` };
+          if (partition.estimatedTokens > maxInputTokens) throw new Error("A Sol review pass exceeds the configured input bound.");
+          const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/pass-${index + 1}.md`, partition.content);
+          return { ...partition, file, passId: `pass-${index + 1}` };
         })
       : [{ ...reviewPackage, file: packageFile, passId: "pass-1" }];
     const passReviews = [];
@@ -254,6 +435,8 @@ export class WorkerCoordinator {
     let finalWorker = null;
     if (passReviews.length > 1) {
       const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify(passReviews, null, 2)}\n`);
+      const synthesisTokens = Math.ceil(fs.statSync(synthesisFile).size / 4) + 1024;
+      if (synthesisTokens > maxInputTokens) throw new Error("Sol synthesis evidence exceeds the configured input bound; narrow the review target.");
       const executed = await this.#executeReviewPass({
         workerId: `sol-${reviewId}-synth`, orchestrationId, cwd: reviewCwd, effort: "xhigh",
         prompt: `${promptTemplate}\n\nSynthesize every bounded pass in ${synthesisFile}. Preserve material findings and verify coverage.`,
@@ -264,13 +447,22 @@ export class WorkerCoordinator {
       finalWorker = executed.worker;
     }
     const gate = evaluateReviewGate(review);
-    const reportFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, gate, packageHash: reviewPackage.hash }, null, 2)}\n`);
+    const contextBudget = {
+      contextWindow: 258000,
+      packageInputLimit: maxInputTokens,
+      promptAndSchemaReserve: 8000,
+      outputReserve: 32000,
+      toolAndErrorReserve: 8000,
+      unallocatedSafetyMargin: 258000 - maxInputTokens - 48000
+    };
+    const reportFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, gate, packageHash: reviewPackage.hash, contextBudget }, null, 2)}\n`);
     const result = {
       id: reviewId, status: "completed", workerId: finalWorker?.id ?? `sol-${reviewId}-p1`,
       threadId: finalWorker?.thread.id ?? this.status(`sol-${reviewId}-p1`).thread.id,
       specVerdict: review.specVerdict, qualityVerdict: review.qualityVerdict,
       findings: review.findings, summary: review.summary, gate, packageFile,
       packageHash: reviewPackage.hash, reportFile,
+      contextBudget,
       effort: finalWorker?.effort ?? this.status(`sol-${reviewId}-p1`).effort,
       passCount: passReviews.length, synthesized: passReviews.length > 1,
       completedAt: nowIso()
@@ -278,7 +470,15 @@ export class WorkerCoordinator {
     this.store.transaction((state) => {
       state.reviews ??= {};
       state.reviews[reviewId] = result;
-      if (params.workerId && state.workers[params.workerId]) state.workers[params.workerId].reviewGate = gate.status;
+      if (params.workerId && state.workers[params.workerId]) {
+        const worker = state.workers[params.workerId];
+        worker.reviewGate = gate.status;
+        worker.reviewBinding = {
+          reviewId, baseCommit: worker.baseCommit, headCommit: worker.headCommit,
+          tree: worker.tree, packageFile, packageHash: reviewPackage.hash, gate: gate.status,
+          completedAt: result.completedAt
+        };
+      }
     });
     return result;
   }
@@ -291,13 +491,32 @@ export class WorkerCoordinator {
       role: "sol",
       effort: options.effort
     });
-    await this.send(worker.id, options.prompt, `${options.idempotencyKey}-turn`, { outputSchema: options.schema });
-    const finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
-    if (finished.turn?.status !== "completed") throw new Error(`Sol review did not complete: ${finished.turn?.status ?? "unknown"}.`);
-    let parsed;
-    try { parsed = JSON.parse(finished.lastOutput ?? ""); }
-    catch (error) { throw new Error(`Sol returned invalid structured review output: ${error.message}`); }
-    return { worker, review: validateSolReview(parsed, { reviewId: options.reviewId, passId: options.passId }) };
+    try {
+      await this.send(worker.id, options.prompt, `${options.idempotencyKey}-turn`, { outputSchema: options.schema });
+      let finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
+      if (finished.turn?.status !== "completed") throw new Error(`Sol review did not complete: ${finished.turn?.status ?? "unknown"}.`);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const parsed = JSON.parse(finished.lastOutput ?? "");
+          return { worker, review: validateSolReview(parsed, { reviewId: options.reviewId, passId: options.passId }) };
+        } catch (error) {
+          const diagnostic = String(finished.lastOutput ?? "").slice(0, 16384);
+          this.store.writeArtifact(options.orchestrationId, `reviews/${options.reviewId}/passes/${options.passId}-invalid-${attempt + 1}.txt`, diagnostic);
+          if (attempt === 1) throw new Error(`Sol returned invalid structured review output after one repair attempt: ${error.message}`);
+          await this.send(
+            worker.id,
+            `Your previous structured review was invalid: ${error.message}. Return a corrected complete JSON review only; preserve all supported findings.`,
+            `${options.idempotencyKey}-repair`,
+            { outputSchema: options.schema }
+          );
+          finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
+          if (finished.turn?.status !== "completed") throw new Error(`Sol review repair did not complete: ${finished.turn?.status ?? "unknown"}.`);
+        }
+      }
+      throw new Error("Sol review validation failed.");
+    } finally {
+      await this.close(worker.id).catch(() => {});
+    }
   }
 
   status(workerId) {
@@ -327,17 +546,30 @@ export class WorkerCoordinator {
     if (prior) return prior;
     const pending = this.pendingRequests.get(requestId);
     if (!pending) throw new Error(`Request ${requestId} is already resolved, stale, or unknown.`);
+    const worker = this.status(pending.workerId);
+    const record = worker.pendingRequest;
+    if (!record || record.id !== requestId || record.status !== "pending") throw new Error(`Request ${requestId} is stale.`);
+    if (Date.parse(record.expiresAt) <= Date.now()) throw new Error(`Request ${requestId} has expired.`);
+    if (record.threadId !== worker.thread.id || record.turnId !== worker.turn?.id) throw new Error(`Request ${requestId} no longer matches the active thread and turn.`);
+    validateRequestResult(record, result);
+    const canResume = this.activeTurns < this.maxConcurrent;
+    const response = { requestId, status: canResume ? "resolved" : "queued" };
+    if (canResume) this.#completeResolution({ requestId, pending, result });
+    else this.pendingResolutions.push({ requestId, pending, result });
+    this.store.transaction((state) => { state.idempotency[idempotencyKey] = response; });
+    return response;
+  }
+
+  #completeResolution({ requestId, pending, result }) {
     pending.client.respondToServerRequest(pending.serverRequestId, result);
     this.pendingRequests.delete(requestId);
-    const response = { requestId, status: "resolved" };
     this.store.transaction((state) => {
       const worker = state.workers[pending.workerId];
       worker.pendingRequest = { ...worker.pendingRequest, status: "resolved", resolvedAt: nowIso() };
       worker.turn.status = "running";
-      state.idempotency[idempotencyKey] = response;
+      worker.turn.slotHeld = true;
     });
     this.activeTurns += 1;
-    return response;
   }
 
   async stop(workerId) {
@@ -346,6 +578,11 @@ export class WorkerCoordinator {
       const pending = this.pendingRequests.get(worker.pendingRequest.id);
       pending?.client.rejectServerRequest?.(pending.serverRequestId, -32800, "Cancelled by controller");
       this.pendingRequests.delete(worker.pendingRequest.id);
+      this.pendingResolutions = this.pendingResolutions.filter((entry) => entry.requestId !== worker.pendingRequest.id);
+      this.store.transaction((state) => {
+        state.workers[workerId].pendingRequest.status = "cancelled";
+        state.workers[workerId].pendingRequest.resolvedAt = nowIso();
+      });
     }
     if (worker.turn?.id && ["running", "waiting-input", "waiting-approval"].includes(worker.turn.status)) {
       await this.clients.get(workerId)?.request("turn/interrupt", { threadId: worker.thread.id, turnId: worker.turn.id });
@@ -354,11 +591,40 @@ export class WorkerCoordinator {
   }
 
   async close(workerId) {
+    this.closingWorkers.add(workerId);
     await this.stop(workerId);
     await this.clients.get(workerId)?.close();
     this.clients.delete(workerId);
     this.store.transaction((state) => { state.workers[workerId].supervisorStatus = "closed"; });
+    this.closingWorkers.delete(workerId);
     return this.status(workerId);
+  }
+
+  #handleTransportExit(workerId, error) {
+    if (this.closingWorkers.has(workerId)) return;
+    const current = this.store.load().workers[workerId];
+    if (!current || current.supervisorStatus !== "online") return;
+    const held = current.turn?.slotHeld === true;
+    const requestId = current.pendingRequest?.status === "pending" ? current.pendingRequest.id : null;
+    if (requestId) this.pendingRequests.delete(requestId);
+    this.clients.delete(workerId);
+    this.store.transaction((state) => {
+      const worker = state.workers[workerId];
+      worker.supervisorStatus = "crashed";
+      worker.thread.status = "unavailable";
+      if (worker.turn && !["completed", "failed", "interrupted"].includes(worker.turn.status)) {
+        worker.turn.status = "indeterminate";
+        worker.turn.slotHeld = false;
+        worker.turn.error = `Codex app-server transport was lost: ${error?.message ?? "closed"}. Resume and retry explicitly.`;
+      }
+      if (worker.pendingRequest?.status === "pending") {
+        worker.pendingRequest.status = "cancelled";
+        worker.pendingRequest.resolvedAt = nowIso();
+      }
+    });
+    if (held) this.activeTurns = Math.max(0, this.activeTurns - 1);
+    this.#notifyWaiters(workerId);
+    void this.#pump();
   }
 
   async #pump() {
@@ -367,12 +633,22 @@ export class WorkerCoordinator {
     const started = new Set();
     try {
       while (this.activeTurns < this.maxConcurrent) {
+        const resolution = this.pendingResolutions.shift();
+        if (resolution) {
+          this.#completeResolution(resolution);
+          continue;
+        }
         const entry = this.store.load().queue[0];
         if (!entry) break;
-        this.store.transaction((state) => { state.queue.shift(); });
+        this.store.transaction((state) => {
+          state.queue.shift();
+          state.inFlightQueue ??= {};
+          state.inFlightQueue[entry.id] = { ...entry, claimedAt: nowIso() };
+          state.workers[entry.workerId].turn.slotHeld = true;
+        });
         this.activeTurns += 1;
         started.add(entry.id);
-        void this.#startEntry(entry).catch((error) => this.#failEntry(entry.workerId, error));
+        void this.#startEntry(entry).catch((error) => this.#failEntry(entry, error));
       }
     } finally { this.pumping = false; }
     return started;
@@ -387,9 +663,10 @@ export class WorkerCoordinator {
       effort: worker.effort, outputSchema: entry.outputSchema
     });
     this.store.transaction((state) => {
+      delete state.inFlightQueue?.[entry.id];
       const turn = state.workers[entry.workerId].turn;
       if (turn.status === "queued" || turn.status === "running") {
-        state.workers[entry.workerId].turn = { id: response.turn.id, status: "running", startedAt: nowIso() };
+        state.workers[entry.workerId].turn = { id: response.turn.id, status: "running", slotHeld: true, startedAt: nowIso() };
       }
     });
   }
@@ -408,11 +685,12 @@ export class WorkerCoordinator {
       const worker = state.workers[workerId];
       if (!worker) return;
       if (message.method === "turn/started") {
-        worker.turn = { id: message.params.turn.id, status: "running", startedAt: nowIso() };
+        worker.turn = { id: message.params.turn.id, status: "running", slotHeld: worker.turn?.slotHeld === true, startedAt: nowIso() };
       } else {
         const status = message.params.turn.status;
         worker.turn = { ...(worker.turn ?? {}), id: message.params.turn.id, status: status === "completed" ? "completed" : status, completedAt: nowIso() };
-        terminal = true;
+        terminal = worker.turn.slotHeld === true;
+        worker.turn.slotHeld = false;
       }
     });
     if (terminal) {
@@ -451,27 +729,41 @@ export class WorkerCoordinator {
     if (!isInput && !isApproval) throw new Error(`Unsupported server request: ${message.method}`);
     const requestId = `req-${randomUUID()}`;
     const worker = this.status(workerId);
+    const threadId = message.params?.threadId ?? worker.thread.id;
+    const turnId = message.params?.turnId ?? worker.turn?.id ?? null;
+    if (worker.role === "sol" && isApproval) throw new Error("Sol review workers cannot request mutation approval.");
+    if (threadId !== worker.thread.id || !turnId || turnId !== worker.turn?.id) throw new Error("Server request does not match the active worker thread and turn.");
+    const payload = sanitizeRequestValue(message.params ?? {});
     const record = {
       id: requestId, status: "pending", method: message.method,
-      threadId: message.params?.threadId ?? worker.thread.id,
-      turnId: message.params?.turnId ?? worker.turn?.id ?? null,
+      threadId,
+      turnId,
       itemId: message.params?.itemId ?? null, approvalId: message.params?.approvalId ?? null,
-      isBlocking: true, createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+      isBlocking: true,
+      payload,
+      allowedDecisions: allowedRequestDecisions(message.method, message.params),
+      createdAt: nowIso(), expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
     };
     this.pendingRequests.set(requestId, { workerId, client: this.clients.get(workerId), serverRequestId: message.id });
     this.store.transaction((state) => {
       state.workers[workerId].pendingRequest = record;
       state.workers[workerId].turn.status = isApproval ? "waiting-approval" : "waiting-input";
+      state.workers[workerId].turn.slotHeld = false;
     });
     this.activeTurns = Math.max(0, this.activeTurns - 1);
     this.#notifyWaiters(workerId);
     void this.#pump();
   }
 
-  #failEntry(workerId, error) {
-    this.activeTurns = Math.max(0, this.activeTurns - 1);
+  #failEntry(entry, error) {
+    const workerId = entry.workerId;
+    const held = this.status(workerId).turn?.slotHeld === true;
+    if (held) this.activeTurns = Math.max(0, this.activeTurns - 1);
     this.store.transaction((state) => {
-      state.workers[workerId].turn = { ...(state.workers[workerId].turn ?? {}), status: "failed", error: String(error.message ?? error), completedAt: nowIso() };
+      delete state.inFlightQueue?.[entry.id];
+      state.recoveryQueue ??= [];
+      state.recoveryQueue.push({ ...entry, recoveryStatus: "failed-to-start", error: String(error.message ?? error), recoveredAt: nowIso() });
+      state.workers[workerId].turn = { ...(state.workers[workerId].turn ?? {}), status: "failed", slotHeld: false, error: String(error.message ?? error), completedAt: nowIso() };
     });
     this.#notifyWaiters(workerId);
     void this.#pump();

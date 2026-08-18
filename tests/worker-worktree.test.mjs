@@ -8,7 +8,8 @@ import {
   applyReviewedCommits,
   closeTaskWorktree,
   commitTaskWorktree,
-  createTaskWorktree
+  createTaskWorktree,
+  restoreTaskWorktree
 } from "../plugins/codex/scripts/lib/worker-worktree.mjs";
 
 function baseRepo() {
@@ -58,6 +59,28 @@ test("integration applies only reviewed commits with compare-and-swap HEAD", () 
   assert.throws(() => applyReviewedCommits({ integrationCwd: repo, expectedHead: base, base, head: committed.commit }), /expected HEAD/i);
 });
 
+test("multi-commit integration conflict restores the exact starting HEAD", () => {
+  const repo = baseRepo();
+  const base = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-conflict", base, worktreeRoot: makeTempDir("worker-worktrees-") });
+  fs.writeFileSync(path.join(created.worktree, "first.txt"), "first\n");
+  commitTaskWorktree(created.worktree, { message: "first" });
+  fs.writeFileSync(path.join(created.worktree, "app.js"), "worker\n");
+  const final = commitTaskWorktree(created.worktree, { message: "conflicting second" });
+
+  fs.writeFileSync(path.join(repo, "app.js"), "integration\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "integration change"], { cwd: repo });
+  const integrationHead = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+
+  assert.throws(
+    () => applyReviewedCommits({ integrationCwd: repo, expectedHead: integrationHead, base, head: final.commit }),
+    /failed and was aborted/i
+  );
+  assert.equal(run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim(), integrationHead);
+  assert.equal(fs.existsSync(path.join(repo, "first.txt")), false);
+});
+
 test("worktree close refuses ignored or untracked material", () => {
   const repo = baseRepo();
   fs.writeFileSync(path.join(repo, ".gitignore"), "artifact.bin\n");
@@ -66,4 +89,13 @@ test("worktree close refuses ignored or untracked material", () => {
   const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-1", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
   fs.writeFileSync(path.join(created.worktree, "artifact.bin"), "keep me\n");
   assert.throws(() => closeTaskWorktree({ repoRoot: repo, worktree: created.worktree }), /ignored or untracked/i);
+});
+
+test("a saved worker branch can reconstruct its missing clean worktree", () => {
+  const repo = baseRepo();
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-restore", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
+  closeTaskWorktree({ repoRoot: repo, worktree: created.worktree });
+  const restored = restoreTaskWorktree({ repoRoot: repo, branch: created.branch, worktree: created.worktree });
+  assert.equal(fs.existsSync(restored.worktree), true);
+  assert.equal(run("git", ["branch", "--show-current"], { cwd: restored.worktree }).stdout.trim(), created.branch);
 });

@@ -23,7 +23,8 @@ function paths(values = []) {
 }
 
 export function resolveWorkerReviewTarget(cwd, options = {}) {
-  const selectors = [options.base, options.worktree, options.staged, options.unstaged, options.last, options.range, options.auditPaths?.length || options.files?.length].filter(Boolean);
+  const filesAreAudit = options.files?.length && !options.base && !options.range && !options.last && !options.worktree && !options.staged && !options.unstaged;
+  const selectors = [options.base, options.worktree, options.staged, options.unstaged, options.last, options.range, options.auditPaths?.length || filesAreAudit].filter(Boolean);
   if (selectors.length > 1) throw new Error("Select exactly one review target: base, worktree, staged, unstaged, last, range, or audit.");
   const selectedPaths = paths(options.paths ?? options.files ?? options.auditPaths ?? []);
   if (options.worktree) return { mode: "worktree", paths: selectedPaths };

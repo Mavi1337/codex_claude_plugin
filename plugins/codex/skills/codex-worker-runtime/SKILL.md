@@ -21,12 +21,12 @@ integration.
 
 | Need | Operation and required options |
 |---|---|
-| Start Luna | `worker start --worker ID --orchestration ID` |
+| Start Luna | `worker start --worker ID --orchestration ID --allowed-path PATH...` |
 | Message | `worker send --worker ID --prompt TEXT --idempotency-key KEY` |
 | Observe | `worker wait\|status --worker ID`; `worker list` |
 | Blocking callback | `worker resolve-request --request ID --result-json JSON --idempotency-key KEY` |
 | Interrupt/lifecycle | `worker stop\|close\|resume --worker ID` |
-| Trusted commit | `integration commit --worker ID --message TEXT [--allowed-path PATH]...` |
+| Trusted commit | `integration commit --worker ID --message TEXT --allowed-path PATH...` |
 | Task review | `review start --review ID --orchestration ID --worker ID --task-review` |
 | Flexible review | `review start --review ID --orchestration ID` plus one target |
 | Integrate | `integration apply --worker ID --expected-head OID` |
@@ -46,5 +46,13 @@ high. Reports are returned as canonical file paths.
   authorized by the task may be resolved by the controller.
 - `close` preserves thread/branch state. `resume` restores that explicit worker.
 - Luna edits/tests; only `integration commit` writes Git metadata.
+- The first Luna message becomes the canonical task brief; later messages are
+  hashed follow-up instructions. A task review fails closed unless the worker
+  completed with a validated implementation report, test evidence, concerns,
+  and an explicit allowed-path assignment.
+- `review start` can run for the full Sol turn. Its in-flight record is durable
+  and observable with `review status --review ID`; retry the same operation only
+  with the same idempotency key.
 - Only apply after the returned review gate is `pass`, using the integration
-  HEAD captured immediately before the operation.
+  HEAD captured immediately before the operation. The runtime rechecks the
+  reviewed package hash and exact base/head/tree under the integration lease.

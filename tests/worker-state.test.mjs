@@ -54,3 +54,15 @@ test("artifact paths cannot escape their orchestration", () => {
   const report = store.writeArtifact("orch-1", "tasks/task-1/report.md", "done\n");
   assert.equal(fs.readFileSync(report, "utf8"), "done\n");
 });
+
+test("worker state rejects a second live process lock owner", () => {
+  const repo = makeTempDir("worker-state-repo-");
+  const dataRoot = makeTempDir("worker-state-data-");
+  initGitRepo(repo);
+  const store = createWorkerStore(repo, { dataRoot });
+  const release = store.acquireOwnership("test-owner");
+  assert.throws(() => store.acquireOwnership("test-owner"), /already owned/i);
+  release();
+  const releaseAgain = store.acquireOwnership("test-owner");
+  releaseAgain();
+});

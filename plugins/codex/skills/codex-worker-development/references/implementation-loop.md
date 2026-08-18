@@ -2,8 +2,9 @@
 
 ## Per task
 
-1. Start an explicit Luna worker with the shared orchestration ID. Its isolated
-   worktree is created from the current accepted integration HEAD.
+1. Start an explicit Luna worker with the shared orchestration ID and every
+   declared `--allowed-path`. Its isolated worktree is created from the current
+   accepted integration HEAD.
 2. Send one focused instruction referencing the plan/spec paths, exact task,
    allowed paths, required interfaces, and verification commands. Use a unique
    idempotency key.

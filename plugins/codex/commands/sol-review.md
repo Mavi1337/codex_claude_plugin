@@ -12,6 +12,9 @@ and preserve the user's target arguments. Supported targets include branch,
 worktree, staged, unstaged, last N, explicit range, repeated path/file filters,
 and subsystem/file audit. Default effort is xhigh for this standalone/final
 review. Return the compact verdict and canonical `reportFile`; do not fix code.
+The start call may remain open for the full review. If observing it from another
+controller turn, use `review status --review ID`; preserve the original
+idempotency key instead of starting a duplicate.
 
 Raw target arguments:
 `$ARGUMENTS`

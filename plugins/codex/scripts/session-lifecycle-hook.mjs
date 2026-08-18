@@ -83,7 +83,11 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  await shutdownCoordinatorSession(cwd, { dataRoot: process.env[PLUGIN_DATA_ENV] });
+  try {
+    await shutdownCoordinatorSession(cwd, { dataRoot: process.env[PLUGIN_DATA_ENV] });
+  } catch {
+    // Worker coordination is Git-only; legacy cleanup must still run elsewhere.
+  }
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]

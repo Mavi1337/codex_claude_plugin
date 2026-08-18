@@ -98,7 +98,8 @@ async function main() {
         orchestrationId: assertSafeId(required(options, "orchestration"), "orchestration"),
         cwd,
         role: options.role ?? "luna",
-        effort: options.effort
+        effort: options.effort,
+        allowedPaths: options["allowed-path"]
       };
     }
     if (action === "send") params.prompt = required(options, "prompt");
@@ -119,7 +120,9 @@ async function main() {
   return sendCoordinatorRequest(session, operation, params, {
     requestId,
     idempotencyKey: options["idempotency-key"] ?? requestId,
-    timeoutMs: action === "wait" ? (params.timeoutMs || 30000) + 1000 : 10000
+    timeoutMs: action === "wait"
+      ? (params.timeoutMs || 30000) + 1000
+      : operation === "review.start" ? 31 * 60 * 1000 : 10000
   });
 }
 
