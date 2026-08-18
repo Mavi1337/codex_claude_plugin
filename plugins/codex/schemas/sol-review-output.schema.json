@@ -3,29 +3,117 @@
   "title": "Sol Review Output",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "specVerdict", "qualityVerdict", "summary", "findings"],
+  "required": [
+    "schemaVersion",
+    "specVerdict",
+    "qualityVerdict",
+    "summary",
+    "findings"
+  ],
   "properties": {
-    "schemaVersion": { "const": 1 },
-    "specVerdict": { "enum": ["pass", "fail", "cannot-verify"] },
-    "qualityVerdict": { "enum": ["approve", "changes-required"] },
-    "summary": { "type": "string" },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "specVerdict": {
+      "enum": [
+        "pass",
+        "fail",
+        "cannot-verify"
+      ],
+      "type": "string"
+    },
+    "qualityVerdict": {
+      "enum": [
+        "approve",
+        "changes-required"
+      ],
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
     "findings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "evidence", "impact", "recommendation", "confidence", "locations"],
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "evidence",
+          "impact",
+          "recommendation",
+          "confidence",
+          "locations",
+          "supersedes",
+          "duplicateOf"
+        ],
         "properties": {
-          "id": { "type": "string" },
-          "severity": { "enum": ["critical", "important", "minor"] },
-          "title": { "type": "string" },
-          "evidence": { "type": "string" },
-          "impact": { "type": "string" },
-          "recommendation": { "type": "string" },
-          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-          "locations": { "type": "array", "items": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "line": { "type": ["integer", "null"], "minimum": 1 } }, "additionalProperties": false } },
-          "supersedes": { "type": "array", "items": { "type": "string" } },
-          "duplicateOf": { "type": ["string", "null"] }
+          "id": {
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "important",
+              "minor"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          },
+          "recommendation": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "path",
+                "line"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "duplicateOf": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       }
     }

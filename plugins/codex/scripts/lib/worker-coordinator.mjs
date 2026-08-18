@@ -900,13 +900,15 @@ export class WorkerCoordinator {
         worker.turn = { id: message.params.turn.id, status: "running", slotHeld: worker.turn?.slotHeld === true, startedAt: nowIso() };
       } else {
         const status = message.params.turn.status;
+        const turnError = message.params.turn.error;
         worker.turn = { ...(worker.turn ?? {}), id: message.params.turn.id, status: status === "completed" ? "completed" : status, completedAt: nowIso() };
+        if (turnError) worker.turn.error = typeof turnError === "string" ? turnError : JSON.stringify(turnError);
         terminal = worker.turn.slotHeld === true;
         worker.turn.slotHeld = false;
       }
     });
     if (terminal) {
-      this.#finalizeWorkerResult(workerId);
+      if (message.params.turn.status === "completed") this.#finalizeWorkerResult(workerId);
       this.activeTurns = Math.max(0, this.activeTurns - 1);
       this.#notifyWaiters(workerId);
       void this.#pump();
