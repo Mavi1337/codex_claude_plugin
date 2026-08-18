@@ -25,7 +25,7 @@ const token = fs.readFileSync(tokenFile, "utf8").trim();
 const coordinator = new WorkerCoordinator({ cwd, dataRoot });
 const identity = coordinator.store.identity;
 const target = parseBrokerEndpoint(endpoint);
-if (target.type === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.path);
+if (target.kind === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.path);
 
 const server = net.createServer((socket) => {
   socket.setEncoding("utf8");
@@ -50,7 +50,9 @@ const server = net.createServer((socket) => {
             throw Object.assign(new Error("Coordinator authorization failed."), { code: "UNAUTHORIZED" });
           }
           const result = await coordinator.dispatch(envelope.operation, envelope.params, envelope.idempotencyKey);
-          socket.write(`${JSON.stringify({ version: 1, requestId: envelope.requestId, result })}\n`);
+          socket.write(`${JSON.stringify({ version: 1, requestId: envelope.requestId, result })}\n`, () => {
+            if (envelope.operation === "coordinator.shutdown") setImmediate(() => { void shutdown(); });
+          });
         } catch (error) {
           socket.write(`${JSON.stringify({ version: 1, requestId: envelope?.requestId ?? null, error: { code: error.code ?? "INTERNAL", message: error.message } })}\n`);
         }
@@ -60,13 +62,13 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(target.path, () => {
-  if (target.type === "unix") fs.chmodSync(target.path, 0o600);
+  if (target.kind === "unix") fs.chmodSync(target.path, 0o600);
 });
 
 async function shutdown() {
   server.close();
   await Promise.allSettled(coordinator.list().map((worker) => coordinator.close(worker.id)));
-  if (target.type === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.path);
+  if (target.kind === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.path);
   process.exit(0);
 }
 process.on("SIGTERM", () => { void shutdown(); });

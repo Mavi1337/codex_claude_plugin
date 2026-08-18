@@ -47,6 +47,12 @@ export class WorkerCoordinator {
         break;
       }
       case "worker.resolve-request": return this.resolveRequest(params.requestId, params.result, idempotencyKey);
+      case "coordinator.status": result = {
+        status: "online", repositoryId: this.store.identity.repositoryId,
+        activeTurns: this.activeTurns, queuedTurns: this.store.load().queue.length,
+        workerCount: this.list().length, maxConcurrent: this.maxConcurrent
+      }; break;
+      case "coordinator.shutdown": result = { status: "shutting-down" }; break;
       default: throw new Error(`Unsupported worker operation: ${operation}.`);
     }
     this.store.transaction((state) => { state.idempotency[idempotencyKey] = result; });
