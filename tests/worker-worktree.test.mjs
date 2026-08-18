@@ -99,3 +99,58 @@ test("a saved worker branch can reconstruct its missing clean worktree", () => {
   assert.equal(fs.existsSync(restored.worktree), true);
   assert.equal(run("git", ["branch", "--show-current"], { cwd: restored.worktree }).stdout.trim(), created.branch);
 });
+
+test("a directory allowed path covers files beneath it, including both sides of a rename", () => {
+  const repo = baseRepo();
+  fs.mkdirSync(path.join(repo, "lane"));
+  fs.writeFileSync(path.join(repo, "lane", "old.js"), "export const lane = 1;\n");
+  run("git", ["add", "lane/old.js"], { cwd: repo });
+  run("git", ["commit", "-m", "lane"], { cwd: repo });
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-1", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
+  fs.mkdirSync(path.join(created.worktree, "lane", "nested"), { recursive: true });
+  fs.writeFileSync(path.join(created.worktree, "lane", "README.md"), "docs\n");
+  fs.writeFileSync(path.join(created.worktree, "lane", "nested", "deep.js"), "export const deep = 1;\n");
+  run("git", ["mv", "lane/old.js", "lane/new.js"], { cwd: created.worktree });
+
+  const committed = commitTaskWorktree(created.worktree, { message: "task", allowedPaths: ["lane"] });
+  assert.deepEqual(committed.paths, ["lane/README.md", "lane/nested/deep.js", "lane/new.js"].sort());
+  assert.equal(run("git", ["status", "--porcelain"], { cwd: created.worktree }).stdout, "");
+  const tracked = run("git", ["ls-tree", "-r", "--name-only", "HEAD"], { cwd: created.worktree }).stdout.trim().split("\n").sort();
+  assert.deepEqual(tracked, ["app.js", "lane/README.md", "lane/nested/deep.js", "lane/new.js"]);
+});
+
+test("a plain move is committed as a delete plus an add when git mv is unavailable", () => {
+  const repo = baseRepo();
+  fs.mkdirSync(path.join(repo, "lane"));
+  fs.writeFileSync(path.join(repo, "lane", "old.js"), "export const lane = 1;\n");
+  run("git", ["add", "lane/old.js"], { cwd: repo });
+  run("git", ["commit", "-m", "lane"], { cwd: repo });
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-1", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
+  fs.renameSync(path.join(created.worktree, "lane", "old.js"), path.join(created.worktree, "lane", "new.js"));
+
+  const committed = commitTaskWorktree(created.worktree, { message: "task", allowedPaths: ["lane"] });
+  assert.ok(committed.paths.includes("lane/new.js"));
+  assert.equal(run("git", ["status", "--porcelain"], { cwd: created.worktree }).stdout, "");
+  assert.equal(fs.existsSync(path.join(created.worktree, "lane", "old.js")), false);
+});
+
+test("a directory allowed path does not cover a sibling with the same prefix", () => {
+  const repo = baseRepo();
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-1", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
+  fs.mkdirSync(path.join(created.worktree, "lane"));
+  fs.writeFileSync(path.join(created.worktree, "lane", "ok.js"), "ok\n");
+  fs.writeFileSync(path.join(created.worktree, "lane-other.js"), "not ok\n");
+  assert.throws(
+    () => commitTaskWorktree(created.worktree, { message: "task", allowedPaths: ["lane"] }),
+    /outside the allowed paths: lane-other\.js/
+  );
+});
+
+test("an allowed path may not widen the assignment to the whole worktree", () => {
+  const repo = baseRepo();
+  const created = createTaskWorktree({ repoRoot: repo, workerId: "luna-1", base: "HEAD", worktreeRoot: makeTempDir("worker-worktrees-") });
+  fs.writeFileSync(path.join(created.worktree, "app.js"), "changed\n");
+  for (const entry of [".", "", "/etc", "lane/../.."]) {
+    assert.throws(() => commitTaskWorktree(created.worktree, { message: "task", allowedPaths: [entry] }), /Invalid allowed path/);
+  }
+});

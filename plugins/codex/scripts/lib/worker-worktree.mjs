@@ -37,6 +37,24 @@ function statusPaths(cwd) {
   return [...new Set(paths)].sort();
 }
 
+function normalizeAllowedPath(entry) {
+  const value = String(entry).trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  const segments = value.split("/");
+  if (!value || value === "." || value.startsWith("/") || segments.includes("..") || segments.includes(".")) {
+    throw new Error(`Invalid allowed path: ${entry}. Allowed paths must be repository-relative files or directories.`);
+  }
+  return value;
+}
+
+// An allowed path covers the file itself or, when it names a directory, everything beneath it.
+// `statusPaths` reports both sides of a rename, so a move stays inside the assignment only when
+// its source and destination are both covered.
+export function unexpectedPaths(paths, allowedPaths) {
+  if (!allowedPaths) return [];
+  const allowed = allowedPaths.map(normalizeAllowedPath);
+  return paths.filter((entry) => !allowed.some((prefix) => entry === prefix || entry.startsWith(`${prefix}/`)));
+}
+
 export function createTaskWorktree({ repoRoot, workerId, base = "HEAD", worktreeRoot }) {
   assertSafeId(workerId, "workerId");
   const baseCommit = fullOid(repoRoot, base);
@@ -98,15 +116,17 @@ export function commitTaskWorktree(cwd, options = {}) {
   }
   const paths = statusPaths(cwd);
   if (paths.length === 0) throw new Error("Task worktree has no changes to commit.");
-  const allowed = options.allowedPaths ? new Set(options.allowedPaths.map(String)) : null;
-  if (allowed) {
-    const unexpected = paths.filter((entry) => !allowed.has(entry));
-    if (unexpected.length) throw new Error(`Task changed paths outside the allowed paths: ${unexpected.join(", ")}.`);
-  }
+  const unexpected = unexpectedPaths(paths, options.allowedPaths ?? null);
+  if (unexpected.length) throw new Error(`Task changed paths outside the allowed paths: ${unexpected.join(", ")}.`);
   const submodules = gitChecked(cwd, ["ls-files", "--stage"]).stdout
     .split("\n").filter((line) => line.startsWith("160000 "));
   if (submodules.length) throw new Error("Task commits with submodules are not supported.");
-  gitChecked(cwd, ["add", "--all", "--", ...paths]);
+  // `git add` fails the whole commit on a pathspec that matches nothing. A rename source that is
+  // already staged as a deletion is exactly that: gone from disk and gone from the index, with
+  // nothing left to add. Stage only paths that still exist in one of the two.
+  const tracked = new Set(gitChecked(cwd, ["ls-files", "-z"]).stdout.split("\0").filter(Boolean));
+  const stageable = paths.filter((entry) => tracked.has(entry) || fs.existsSync(path.join(cwd, entry)));
+  if (stageable.length) gitChecked(cwd, ["add", "--all", "--", ...stageable]);
   const stagedPaths = gitChecked(cwd, ["diff", "--cached", "--name-only", "-z"]).stdout.split("\0").filter(Boolean).sort();
   const message = String(options.message ?? "Codex worker task").trim();
   gitChecked(cwd, [
