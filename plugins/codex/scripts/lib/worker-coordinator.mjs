@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 
 import { CodexAppServerClient } from "./app-server.mjs";
 import { assertSafeId } from "./worker-protocol.mjs";
@@ -25,13 +26,17 @@ const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitat
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
-  "item/permissions/requestApproval",
-  "item/tool/requestPermission"
+  "item/permissions/requestApproval"
 ]);
 
 function nowIso() { return new Date().toISOString(); }
 function turnInput(prompt) { return [{ type: "text", text: prompt, text_elements: [] }]; }
 function sha256(value) { return createHash("sha256").update(value).digest("hex"); }
+function reviewWorkerId(reviewId, suffix) { return `sol-${sha256(reviewId).slice(0, 16)}-${suffix}`; }
+function boundedOutput(value) {
+  const source = String(value);
+  return source.length > 131072 ? `${source.slice(0, 131072)}\n[truncated; canonical full output belongs in an artifact]` : source;
+}
 
 function sanitizeRequestValue(value, key = "", depth = 0) {
   if (depth > 6) return "[truncated-depth]";
@@ -45,27 +50,57 @@ function sanitizeRequestValue(value, key = "", depth = 0) {
 }
 
 function allowedRequestDecisions(method, params) {
-  const explicit = Array.isArray(params?.allowedDecisions) ? params.allowedDecisions.map(String) : null;
+  const explicit = Array.isArray(params?.availableDecisions) ? sanitizeRequestValue(params.availableDecisions) : null;
   if (explicit?.length) return explicit;
-  if (APPROVAL_METHODS.has(method)) return ["accept", "decline", "cancel"];
+  if (method === "item/commandExecution/requestApproval") return ["accept", "acceptForSession", "decline", "cancel"];
+  if (method === "item/fileChange/requestApproval") return ["accept", "acceptForSession", "decline", "cancel"];
   if (method === "mcpServer/elicitation/request") return ["accept", "decline", "cancel"];
   return [];
 }
 
+function sameJson(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+
+function isPlainObject(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+
 function validateRequestResult(record, result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Request resolution must be a JSON object.");
-  if (APPROVAL_METHODS.has(record.method)) {
-    if (!record.allowedDecisions.includes(result.decision)) throw new Error(`Approval decision must be one of: ${record.allowedDecisions.join(", ")}.`);
+  if (record.method === "item/commandExecution/requestApproval" || record.method === "item/fileChange/requestApproval") {
+    if (Object.keys(result).some((key) => key !== "decision") || !record.allowedDecisions.some((decision) => sameJson(decision, result.decision))) {
+      throw new Error("Approval decision must exactly match one of the request's available decisions.");
+    }
+  } else if (record.method === "item/permissions/requestApproval") {
+    if (!isPlainObject(result.permissions) || !["turn", "session"].includes(result.scope ?? "turn")) throw new Error("Permission approval requires permissions and a turn/session scope.");
+    if (Object.keys(result).some((key) => !["permissions", "scope", "strictAutoReview"].includes(key))) throw new Error("Permission approval contains unknown fields.");
+    if (Object.keys(result.permissions).some((key) => !["network", "fileSystem"].includes(key))) throw new Error("Permission approval contains unknown permission fields.");
+    if (result.strictAutoReview !== undefined && typeof result.strictAutoReview !== "boolean") throw new Error("strictAutoReview must be boolean.");
   } else if (record.method === "item/tool/requestUserInput") {
     if (!result.answers || typeof result.answers !== "object" || Array.isArray(result.answers)) throw new Error("User-input resolution must contain an answers object.");
+    for (const answer of Object.values(result.answers)) {
+      if (!isPlainObject(answer) || !Array.isArray(answer.answers) || answer.answers.some((entry) => typeof entry !== "string")) throw new Error("Each user-input answer must contain an array of strings.");
+    }
   } else if (record.method === "mcpServer/elicitation/request") {
     if (!record.allowedDecisions.includes(result.action)) throw new Error(`Elicitation action must be one of: ${record.allowedDecisions.join(", ")}.`);
+    if (Object.keys(result).some((key) => !["action", "content", "_meta"].includes(key))) throw new Error("Elicitation response contains unknown fields.");
+    if (result.action === "accept" && !isPlainObject(result.content)) throw new Error("Accepted elicitation requires structured content.");
   }
+}
+
+function snapshotRequirementFiles(store, orchestrationId, workerId, repoRoot, requirementPaths = []) {
+  return requirementPaths.map((entry, index) => {
+    const absolute = path.resolve(repoRoot, String(entry));
+    const root = path.resolve(repoRoot);
+    if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error(`Requirement path escapes the integration worktree: ${entry}.`);
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile()) throw new Error(`Requirement path is not a file: ${entry}.`);
+    const source = fs.readFileSync(absolute);
+    const file = store.writeArtifact(orchestrationId, `tasks/${workerId}/requirements/${index + 1}-${path.basename(absolute)}`, source);
+    return { sourcePath: path.relative(root, absolute).replaceAll(path.sep, "/"), file, hash: sha256(source), bytes: source.length };
+  });
 }
 
 export class WorkerCoordinator {
   constructor(options) {
-    this.cwd = options.cwd;
+    this.cwd = fs.realpathSync(options.cwd);
     this.store = options.store ?? createWorkerStore(options.cwd, { dataRoot: options.dataRoot });
     this.maxConcurrent = options.maxConcurrent ?? 5;
     this.clientFactory = options.clientFactory ?? ((cwd, clientOptions) => CodexAppServerClient.connect(cwd, { ...clientOptions, disableBroker: true }));
@@ -78,7 +113,8 @@ export class WorkerCoordinator {
     this.pumping = false;
     const persisted = this.store.load();
     const recoverable = Object.values(persisted.workers).filter((worker) => worker.supervisorStatus === "online");
-    if (recoverable.length) {
+    const runningReviews = Object.values(persisted.reviews ?? {}).filter((review) => review.status === "running");
+    if (recoverable.length || runningReviews.length) {
       this.store.transaction((state) => {
         for (const worker of Object.values(state.workers)) {
           if (worker.supervisorStatus !== "online") continue;
@@ -97,33 +133,45 @@ export class WorkerCoordinator {
         );
         state.queue = [];
         state.inFlightQueue = {};
+        for (const review of Object.values(state.reviews ?? {})) {
+          if (review.status !== "running") continue;
+          review.status = "indeterminate";
+          review.error = "Coordinator transport was lost while this review was running; retry explicitly with a new idempotency key.";
+          review.completedAt = nowIso();
+        }
+        for (const [key, value] of Object.entries(state.idempotency)) {
+          if (value?.status === "running" && state.reviews?.[value.id]?.status === "indeterminate") {
+            state.idempotency[key] = structuredClone(state.reviews[value.id]);
+          }
+        }
       });
     }
   }
 
   async dispatch(operation, params, idempotencyKey) {
     assertSafeId(idempotencyKey, "idempotencyKey");
+    if (params.cwd && fs.realpathSync(params.cwd) !== this.cwd) {
+      throw new Error(`Coordinator is bound to integration worktree ${this.cwd}; refusing ${params.cwd}.`);
+    }
     const prior = this.store.load().idempotency[idempotencyKey];
     if (prior) return prior;
     if (operation === "review.start") {
       const reviewId = assertSafeId(params.reviewId, "reviewId");
       const running = { id: reviewId, status: "running", startedAt: nowIso() };
       this.store.transaction((state) => {
-        if (state.reviews[reviewId] && state.reviews[reviewId].status !== "failed") throw new Error(`Review ${reviewId} already exists.`);
+        if (state.reviews[reviewId] && !["failed", "indeterminate", "stale"].includes(state.reviews[reviewId].status)) throw new Error(`Review ${reviewId} already exists.`);
         state.reviews[reviewId] = running;
         state.idempotency[idempotencyKey] = running;
       });
-      try {
-        const completed = await this.startReview(params, idempotencyKey);
+      void this.startReview(params, idempotencyKey).then((completed) => {
         this.store.transaction((state) => { state.idempotency[idempotencyKey] = completed; });
-        return completed;
-      } catch (error) {
+      }).catch((error) => {
         this.store.transaction((state) => {
           state.reviews[reviewId] = { ...running, status: "failed", error: String(error.message ?? error), completedAt: nowIso() };
           state.idempotency[idempotencyKey] = state.reviews[reviewId];
         });
-        throw error;
-      }
+      });
+      return running;
     }
     let result;
     switch (operation) {
@@ -177,11 +225,14 @@ export class WorkerCoordinator {
       case "integration.apply": {
         const worker = this.status(params.workerId);
         const binding = worker.reviewBinding;
-        if (worker.reviewGate !== "pass" || binding?.gate !== "pass") {
+        if (!["pass", "pass-with-ruling"].includes(worker.reviewGate) || worker.reviewGate !== binding?.gate) {
           throw new Error("Worker changes have not passed an exact Sol review binding.");
         }
         if (binding.baseCommit !== worker.baseCommit || binding.headCommit !== worker.headCommit || binding.tree !== worker.tree) {
           throw new Error("Worker Git facts no longer match the passing Sol review binding.");
+        }
+        if (binding.reviewTarget?.mode !== "committed" || binding.reviewTarget.base !== binding.baseCommit || binding.reviewTarget.head !== binding.headCommit) {
+          throw new Error("The Sol review target does not match the bound worker commit range.");
         }
         if (!binding.packageFile || !fs.existsSync(binding.packageFile) || sha256(fs.readFileSync(binding.packageFile)) !== binding.packageHash) {
           throw new Error("The immutable Sol review package no longer matches its recorded hash.");
@@ -199,6 +250,28 @@ export class WorkerCoordinator {
       case "review.result": {
         result = this.store.load().reviews?.[assertSafeId(params.reviewId, "reviewId")];
         if (!result) throw new Error(`Unknown review ${params.reviewId}.`);
+        break;
+      }
+      case "review.rule": {
+        const reviewId = assertSafeId(params.reviewId, "reviewId");
+        const review = this.store.load().reviews?.[reviewId];
+        if (!review || review.status !== "completed") throw new Error("Only a completed review can receive a controller ruling.");
+        const reason = String(params.reason ?? "").trim();
+        if (!reason) throw new Error("Controller ruling requires a reason.");
+        const controllerRuling = { waive: params.waiveCannotVerify === true, reason, recordedAt: nowIso() };
+        const ruledGate = evaluateReviewGate(review, { controllerRuling });
+        this.store.transaction((state) => {
+          const current = state.reviews[reviewId];
+          current.controllerRuling = controllerRuling;
+          current.gate = ruledGate;
+          const worker = current.reviewedWorkerId ? state.workers[current.reviewedWorkerId] : null;
+          if (worker?.reviewBinding?.reviewId === reviewId) {
+            worker.reviewGate = ruledGate.status;
+            worker.reviewBinding.gate = ruledGate.status;
+            worker.reviewBinding.controllerRuling = controllerRuling;
+          }
+        });
+        result = this.store.load().reviews[reviewId];
         break;
       }
       case "coordinator.status": result = {
@@ -249,6 +322,8 @@ export class WorkerCoordinator {
     const existing = this.store.load().workers[workerId];
     if (existing && !["closed", "crashed"].includes(existing.supervisorStatus)) throw new Error(`Worker ${workerId} already exists.`);
     const role = options.role ?? "luna";
+    const requirementFiles = existing?.requirementFiles
+      ?? (role === "luna" ? snapshotRequirementFiles(this.store, orchestrationId, workerId, options.cwd, options.requirementPaths ?? []) : []);
     const profile = role === "sol"
       ? {
           model: "gpt-5.6-sol", effort: options.effort ?? "high", sandbox: "read-only",
@@ -295,6 +370,12 @@ export class WorkerCoordinator {
       }
       throw error;
     }
+    const expectedSandboxType = profile.sandbox === "read-only" ? "readOnly" : "workspaceWrite";
+    if (response.model !== undefined && response.model !== profile.model) throw Object.assign(new Error(`Codex selected ${response.model} instead of required ${profile.model}.`), { code: "COMPATIBILITY" });
+    if (response.reasoningEffort !== undefined && response.reasoningEffort !== null && response.reasoningEffort !== profile.effort) throw Object.assign(new Error(`Codex selected effort ${response.reasoningEffort} instead of ${profile.effort}.`), { code: "COMPATIBILITY" });
+    if (response.approvalPolicy !== undefined && !sameJson(response.approvalPolicy, profile.approvalPolicy)) throw Object.assign(new Error("Codex did not apply the required approval policy."), { code: "COMPATIBILITY" });
+    if (response.sandbox?.type && response.sandbox.type !== expectedSandboxType) throw Object.assign(new Error(`Codex applied sandbox ${response.sandbox.type} instead of ${expectedSandboxType}.`), { code: "COMPATIBILITY" });
+    if (response.cwd && fs.realpathSync(response.cwd) !== fs.realpathSync(workerCwd)) throw Object.assign(new Error("Codex thread cwd does not match the assigned worker directory."), { code: "COMPATIBILITY" });
     const record = {
       id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
       branch: worktree?.branch ?? existing?.branch ?? null,
@@ -306,10 +387,22 @@ export class WorkerCoordinator {
       supervisorStatus: "online", thread: { id: response.thread.id, status: "ready" },
       headCommit: existing?.headCommit ?? null, tree: existing?.tree ?? null,
       assignmentPaths: options.allowedPaths?.map(String).sort() ?? existing?.assignmentPaths ?? [],
+      requirementFiles,
       turn: null, pendingRequest: null, createdAt: existing?.createdAt ?? nowIso(), updatedAt: nowIso()
     };
     this.clients.set(workerId, client);
-    this.store.transaction((state) => { state.workers[workerId] = record; });
+    this.store.transaction((state) => {
+      state.workers[workerId] = record;
+      state.capabilities ??= {};
+      state.capabilities[role] = {
+        checkedAt: nowIso(), model: profile.model, effort: profile.effort,
+        sandbox: expectedSandboxType, approvalPolicy: profile.approvalPolicy,
+        contextConfig: profile.config,
+        verifiedMethods: ["model/list", options.threadId ? "thread/resume" : "thread/start"],
+        requiredTurnMethods: ["turn/start", "turn/interrupt"],
+        cliVersion: response.thread?.cliVersion ?? null
+      };
+    });
     if (client.exitPromise && typeof client.exitPromise.then === "function") {
       void client.exitPromise.then((error) => this.#handleTransportExit(workerId, error));
     }
@@ -381,10 +474,16 @@ export class WorkerCoordinator {
       if (!reviewedWorker.taskBriefFile || !fs.existsSync(reviewedWorker.taskBriefFile)) throw new Error("Task review is missing its canonical task brief.");
       if (!reviewedWorker.reportFile || !fs.existsSync(reviewedWorker.reportFile) || !reviewedWorker.result) throw new Error("Task review is missing the validated Luna implementation report and test evidence.");
       if (!Array.isArray(reviewedWorker.assignmentPaths) || reviewedWorker.assignmentPaths.length === 0) throw new Error("Task review is missing the runtime-owned path assignment.");
+      if (!Array.isArray(reviewedWorker.requirementFiles) || reviewedWorker.requirementFiles.length === 0) throw new Error("Task review requires at least one immutable requirement or specification file.");
+      const lunaConstraints = fs.readFileSync(LUNA_PROMPT_URL, "utf8");
       evidenceSections = [
         {
           title: "Binding task brief and follow-up instructions",
           body: (reviewedWorker.instructionFiles ?? []).map((entry) => `### ${entry.hash}\n\n${fs.readFileSync(entry.file, "utf8")}`).join("\n")
+        },
+        {
+          title: "Binding requirement and specification sources",
+          body: reviewedWorker.requirementFiles.map((entry) => `### ${entry.sourcePath} (${entry.hash})\n\n${fs.readFileSync(entry.file, "utf8")}`).join("\n")
         },
         { title: "Validated Luna implementation report, tests, and concerns", body: fs.readFileSync(reviewedWorker.reportFile, "utf8") },
         {
@@ -394,7 +493,9 @@ export class WorkerCoordinator {
             sandbox: reviewedWorker.sandbox, approvalPolicy: reviewedWorker.approvalPolicy,
             baseCommit: reviewedWorker.baseCommit, headCommit: reviewedWorker.headCommit,
             tree: reviewedWorker.tree, allowedPaths: reviewedWorker.assignmentPaths,
-            taskBriefHash: reviewedWorker.taskBriefHash
+            taskBriefHash: reviewedWorker.taskBriefHash,
+            implementerConstraintHash: sha256(lunaConstraints),
+            implementerConstraints: lunaConstraints
           }, null, 2)
         }
       ];
@@ -409,19 +510,19 @@ export class WorkerCoordinator {
     const packages = reviewPackage.requiresPartitioning
       ? reviewPackage.partitions.map((partition, index) => {
           if (partition.estimatedTokens > maxInputTokens) throw new Error("A Sol review pass exceeds the configured input bound.");
-          const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/pass-${index + 1}.md`, partition.content);
-          return { ...partition, file, passId: `pass-${index + 1}` };
+          const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/${partition.id}.md`, partition.content);
+          return { ...partition, file, passId: partition.id };
         })
       : [{ ...reviewPackage, file: packageFile, passId: "pass-1" }];
     const passReviews = [];
     for (let index = 0; index < packages.length; index += 1) {
       const item = packages[index];
       const executed = await this.#executeReviewPass({
-        workerId: `sol-${reviewId}-p${index + 1}`,
+        workerId: reviewWorkerId(reviewId, `p${index + 1}`),
         orchestrationId,
-        cwd: reviewCwd,
+        cwd: path.dirname(item.file),
         effort: params.taskReview ? "high" : (params.effort ?? "xhigh"),
-        prompt: `${promptTemplate}\n\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
+        prompt: `${promptTemplate}\n\nUse only the immutable evidence in this package; do not inspect any live repository or external path.\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
         schema,
         idempotencyKey: `${idempotencyKey}-pass-${index + 1}`,
         timeoutMs: params.timeoutMs,
@@ -434,12 +535,12 @@ export class WorkerCoordinator {
     let review = passReviews[0];
     let finalWorker = null;
     if (passReviews.length > 1) {
-      const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify(passReviews, null, 2)}\n`);
+      const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify({ coverageMap: reviewPackage.coverageMap, passReviews }, null, 2)}\n`);
       const synthesisTokens = Math.ceil(fs.statSync(synthesisFile).size / 4) + 1024;
       if (synthesisTokens > maxInputTokens) throw new Error("Sol synthesis evidence exceeds the configured input bound; narrow the review target.");
       const executed = await this.#executeReviewPass({
-        workerId: `sol-${reviewId}-synth`, orchestrationId, cwd: reviewCwd, effort: "xhigh",
-        prompt: `${promptTemplate}\n\nSynthesize every bounded pass in ${synthesisFile}. Preserve material findings and verify coverage.`,
+        workerId: reviewWorkerId(reviewId, "synth"), orchestrationId, cwd: path.dirname(synthesisFile), effort: "xhigh",
+        prompt: `${promptTemplate}\n\nUse only ${synthesisFile}. Synthesize every bounded pass, preserve material findings, and fail cannot-verify if any coverage-map entry lacks a corresponding pass report.`,
         schema, idempotencyKey: `${idempotencyKey}-synthesis`, timeoutMs: params.timeoutMs,
         reviewId, passId: "synthesis"
       });
@@ -450,36 +551,58 @@ export class WorkerCoordinator {
     const contextBudget = {
       contextWindow: 258000,
       packageInputLimit: maxInputTokens,
-      promptAndSchemaReserve: 8000,
-      outputReserve: 32000,
-      toolAndErrorReserve: 8000,
-      unallocatedSafetyMargin: 258000 - maxInputTokens - 48000
+      fixedInstructionsAndSchemaReserve: 22000,
+      toolExpansionReserve: 24000,
+      outputReserve: 14000,
+      measurementAndErrorReserve: 8000,
+      unallocatedSafetyMargin: 258000 - maxInputTokens - 68000,
+      requestedSettings: { modelContextWindow: 258000, autoCompactTokenLimit: 220000 },
+      confirmedSettings: null,
+      confirmationStatus: "Current app-server thread responses do not echo context settings; request was fail-closed on protocol error."
     };
     const reportFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, gate, packageHash: reviewPackage.hash, contextBudget }, null, 2)}\n`);
     const result = {
-      id: reviewId, status: "completed", workerId: finalWorker?.id ?? `sol-${reviewId}-p1`,
-      threadId: finalWorker?.thread.id ?? this.status(`sol-${reviewId}-p1`).thread.id,
+      id: reviewId, status: "completed", reviewedWorkerId: params.workerId ?? null, workerId: finalWorker?.id ?? reviewWorkerId(reviewId, "p1"),
+      threadId: finalWorker?.thread.id ?? this.status(reviewWorkerId(reviewId, "p1")).thread.id,
       specVerdict: review.specVerdict, qualityVerdict: review.qualityVerdict,
       findings: review.findings, summary: review.summary, gate, packageFile,
       packageHash: reviewPackage.hash, reportFile,
       contextBudget,
-      effort: finalWorker?.effort ?? this.status(`sol-${reviewId}-p1`).effort,
+      effort: finalWorker?.effort ?? this.status(reviewWorkerId(reviewId, "p1")).effort,
       passCount: passReviews.length, synthesized: passReviews.length > 1,
       completedAt: nowIso()
     };
     this.store.transaction((state) => {
       state.reviews ??= {};
-      state.reviews[reviewId] = result;
       if (params.workerId && state.workers[params.workerId]) {
         const worker = state.workers[params.workerId];
-        worker.reviewGate = gate.status;
+        const unchanged = worker.baseCommit === reviewedWorker.baseCommit
+          && worker.headCommit === reviewedWorker.headCommit
+          && worker.tree === reviewedWorker.tree;
+        if (!unchanged) {
+          result.status = "stale";
+          result.gate = { status: "block", reason: "Worker Git facts changed while this review was running." };
+          worker.reviewGate = null;
+          worker.reviewBinding = null;
+          state.reviews[reviewId] = result;
+          return;
+        }
+        worker.reviewRound = (worker.reviewRound ?? 0) + 1;
+        worker.reviewGate = result.gate.status;
         worker.reviewBinding = {
-          reviewId, baseCommit: worker.baseCommit, headCommit: worker.headCommit,
-          tree: worker.tree, packageFile, packageHash: reviewPackage.hash, gate: gate.status,
+          reviewId,
+          baseCommit: reviewedWorker.baseCommit,
+          headCommit: reviewedWorker.headCommit,
+          tree: reviewedWorker.tree,
+          reviewTarget: structuredClone(target),
+          packageFile, packageHash: reviewPackage.hash, gate: result.gate.status,
+          round: worker.reviewRound,
           completedAt: result.completedAt
         };
       }
+      state.reviews[reviewId] = result;
     });
+    this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/report.json`, `${JSON.stringify({ ...review, status: result.status, gate: result.gate, packageHash: reviewPackage.hash, contextBudget }, null, 2)}\n`);
     return result;
   }
 
@@ -586,6 +709,10 @@ export class WorkerCoordinator {
     }
     if (worker.turn?.id && ["running", "waiting-input", "waiting-approval"].includes(worker.turn.status)) {
       await this.clients.get(workerId)?.request("turn/interrupt", { threadId: worker.thread.id, turnId: worker.turn.id });
+      this.store.transaction((state) => {
+        const record = state.capabilities?.[worker.role];
+        if (record && !record.verifiedMethods.includes("turn/interrupt")) record.verifiedMethods.push("turn/interrupt");
+      });
     }
     return this.status(workerId);
   }
@@ -664,6 +791,8 @@ export class WorkerCoordinator {
     });
     this.store.transaction((state) => {
       delete state.inFlightQueue?.[entry.id];
+      const capability = state.capabilities?.[worker.role];
+      if (capability && !capability.verifiedMethods.includes("turn/start")) capability.verifiedMethods.push("turn/start");
       const turn = state.workers[entry.workerId].turn;
       if (turn.status === "queued" || turn.status === "running") {
         state.workers[entry.workerId].turn = { id: response.turn.id, status: "running", slotHeld: true, startedAt: nowIso() };
@@ -675,7 +804,12 @@ export class WorkerCoordinator {
     if (message.method === "item/completed") {
       const item = message.params?.item;
       if (item?.type === "agentMessage" && item.text) {
-        this.store.transaction((state) => { state.workers[workerId].lastOutput = item.text; });
+        const worker = this.status(workerId);
+        const rawOutputFile = this.store.writeArtifact(worker.orchestrationId, `workers/${workerId}/latest-output.txt`, item.text);
+        this.store.transaction((state) => {
+          state.workers[workerId].lastOutput = boundedOutput(item.text);
+          state.workers[workerId].rawOutputFile = rawOutputFile;
+        });
       }
       return;
     }

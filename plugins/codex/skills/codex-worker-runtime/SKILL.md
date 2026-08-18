@@ -21,7 +21,7 @@ integration.
 
 | Need | Operation and required options |
 |---|---|
-| Start Luna | `worker start --worker ID --orchestration ID --allowed-path PATH...` |
+| Start Luna | `worker start --worker ID --orchestration ID --allowed-path PATH... --requirement FILE...` |
 | Message | `worker send --worker ID --prompt TEXT --idempotency-key KEY` |
 | Observe | `worker wait\|status --worker ID`; `worker list` |
 | Blocking callback | `worker resolve-request --request ID --result-json JSON --idempotency-key KEY` |
@@ -29,6 +29,7 @@ integration.
 | Trusted commit | `integration commit --worker ID --message TEXT --allowed-path PATH...` |
 | Task review | `review start --review ID --orchestration ID --worker ID --task-review` |
 | Flexible review | `review start --review ID --orchestration ID` plus one target |
+| Controller ruling | `review rule --review ID --reason TEXT [--waive-cannot-verify]` |
 | Integrate | `integration apply --worker ID --expected-head OID` |
 
 Review targets are `--base REF`, `--range A..B`, `--last N`, `--worktree`,
@@ -49,10 +50,11 @@ high. Reports are returned as canonical file paths.
 - The first Luna message becomes the canonical task brief; later messages are
   hashed follow-up instructions. A task review fails closed unless the worker
   completed with a validated implementation report, test evidence, concerns,
-  and an explicit allowed-path assignment.
-- `review start` can run for the full Sol turn. Its in-flight record is durable
-  and observable with `review status --review ID`; retry the same operation only
-  with the same idempotency key.
+  an explicit allowed-path assignment, and immutable copies of every binding
+  plan/spec/requirement supplied with `--requirement`.
+- `review start` returns a durable `running` acceptance immediately. Poll
+  `review status --review ID` until `completed`, `stale`, `failed`, or
+  `indeterminate`; retry an indeterminate review with a new idempotency key.
 - Only apply after the returned review gate is `pass`, using the integration
   HEAD captured immediately before the operation. The runtime rechecks the
   reviewed package hash and exact base/head/tree under the integration lease.

@@ -12,8 +12,8 @@ import {
 function parse(argv) {
   const positionals = [];
   const options = {};
-  const booleans = new Set(["json", "worktree", "staged", "unstaged", "task-review"]);
-  const repeatable = new Set(["path", "file", "audit-path", "allowed-path"]);
+  const booleans = new Set(["json", "worktree", "staged", "unstaged", "task-review", "waive-cannot-verify"]);
+  const repeatable = new Set(["path", "file", "audit-path", "allowed-path", "requirement"]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (!value.startsWith("--")) { positionals.push(value); continue; }
@@ -62,7 +62,7 @@ async function main() {
       params.expectedHead = required(options, "expected-head");
     }
   } else if (group === "review") {
-    if (!["start", "status", "result"].includes(action)) throw new Error(`Unknown review operation: ${action}.`);
+    if (!["start", "status", "result", "rule"].includes(action)) throw new Error(`Unknown review operation: ${action}.`);
     operation = `review.${action}`;
     params.reviewId = assertSafeId(required(options, "review"), "review");
     if (action === "start") {
@@ -83,6 +83,9 @@ async function main() {
       };
       params.taskReview = options["task-review"] === true;
       if (options.worker) params.workerId = assertSafeId(options.worker, "worker");
+    } else if (action === "rule") {
+      params.reason = required(options, "reason");
+      params.waiveCannotVerify = options["waive-cannot-verify"] === true;
     }
   } else if (group === "worker") {
     if (!["start", "send", "wait", "status", "list", "stop", "close", "resume", "resolve-request"].includes(action)) {
@@ -99,7 +102,8 @@ async function main() {
         cwd,
         role: options.role ?? "luna",
         effort: options.effort,
-        allowedPaths: options["allowed-path"]
+        allowedPaths: options["allowed-path"],
+        requirementPaths: options.requirement
       };
     }
     if (action === "send") params.prompt = required(options, "prompt");

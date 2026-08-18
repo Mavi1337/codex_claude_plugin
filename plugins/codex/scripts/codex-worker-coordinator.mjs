@@ -25,6 +25,7 @@ if (!cwd || !endpoint || !tokenFile) {
 const token = fs.readFileSync(tokenFile, "utf8").trim();
 const store = createWorkerStore(cwd, { dataRoot });
 const releaseOwnership = store.acquireOwnership();
+process.on("exit", () => { try { releaseOwnership(); } catch {} });
 const coordinator = new WorkerCoordinator({ cwd, dataRoot, store, recoverPersistedState: true });
 const identity = coordinator.store.identity;
 const target = parseBrokerEndpoint(endpoint);

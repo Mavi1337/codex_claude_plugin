@@ -17,6 +17,7 @@ function initialState(repositoryId) {
     inFlightQueue: {},
     recoveryQueue: [],
     idempotency: {},
+    capabilities: {},
     integrationLease: null,
     updatedAt: new Date(0).toISOString()
   };
@@ -70,6 +71,29 @@ function processIsAlive(pid) {
   catch (error) { return error?.code === "EPERM"; }
 }
 
+function processIdentity(pid) {
+  if (!processIsAlive(pid)) return null;
+  let executable = null;
+  let startIdentity = null;
+  if (process.platform === "linux") {
+    try { executable = fs.realpathSync(`/proc/${pid}/exe`); } catch {}
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      startIdentity = fields[19] ?? null;
+    } catch {}
+  }
+  if (pid === process.pid) executable ??= fs.realpathSync(process.execPath);
+  return { pid, executable, startIdentity };
+}
+
+function ownerMatchesLiveProcess(owner) {
+  const current = processIdentity(owner?.pid);
+  if (!current) return false;
+  if (!owner.executable || !owner.startIdentity || !current.executable || !current.startIdentity) return true;
+  return owner.executable === current.executable && owner.startIdentity === current.startIdentity;
+}
+
 function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -89,7 +113,7 @@ export function createWorkerStore(cwd, options = {}) {
     while (true) {
       try {
         fs.mkdirSync(lockDir, { mode: 0o700 });
-        durableWrite(path.join(lockDir, "owner.json"), `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`);
+        durableWrite(path.join(lockDir, "owner.json"), `${JSON.stringify({ ...processIdentity(process.pid), acquiredAt: new Date().toISOString() })}\n`);
         let released = false;
         return () => {
           if (released) return;
@@ -107,7 +131,7 @@ export function createWorkerStore(cwd, options = {}) {
         let owner = null;
         try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")); } catch {}
         const stat = fs.statSync(lockDir);
-        if ((!owner || !processIsAlive(owner.pid)) && Date.now() - stat.mtimeMs > 30000) {
+        if ((!owner || !ownerMatchesLiveProcess(owner)) && Date.now() - stat.mtimeMs > 30000) {
           fs.rmSync(lockDir, { recursive: true });
           continue;
         }
@@ -137,6 +161,9 @@ export function createWorkerStore(cwd, options = {}) {
       const value = load();
       const expectedRevision = value.revision;
       mutator(value);
+      const idempotencyKeys = Object.keys(value.idempotency ?? {});
+      for (const key of idempotencyKeys.slice(0, Math.max(0, idempotencyKeys.length - 1000))) delete value.idempotency[key];
+      if ((value.recoveryQueue?.length ?? 0) > 1000) value.recoveryQueue = value.recoveryQueue.slice(-1000);
       const current = fs.existsSync(stateFile) ? load().revision : 0;
       if (current !== expectedRevision) throw new Error("Worker state revision conflict.");
       value.revision += 1;
@@ -173,6 +200,10 @@ export function createWorkerStore(cwd, options = {}) {
   return {
     identity, rootDir, stateFile, backupFile, load, transaction, recoverBackup,
     artifactPath, writeArtifact,
-    acquireOwnership: (name = "coordinator-owner") => acquireLock(name)
+    acquireOwnership: (name = "coordinator-owner") => acquireLock(name),
+    readOwnership: (name = "coordinator-owner") => {
+      try { return JSON.parse(fs.readFileSync(path.join(rootDir, `${name}.lock`, "owner.json"), "utf8")); }
+      catch { return null; }
+    }
   };
 }

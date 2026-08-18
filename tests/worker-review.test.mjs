@@ -52,6 +52,9 @@ test("oversized packages partition one large file into immutable bounded content
   assert.ok(frozen.partitions.length >= 2);
   assert.equal(frozen.partitions.every((partition) => partition.estimatedTokens <= 1000), true);
   assert.equal(frozen.partitions.every((partition) => partition.content.includes(frozen.hash)), true);
+  assert.equal(frozen.partitions.every((partition) => partition.content.includes("Manifest and pass ownership")), true);
+  assert.equal(frozen.partitions.every((partition) => partition.paths.includes("a.txt")), true);
+  assert.equal(frozen.coverageMap.some((entry) => entry.crossCutting), true);
 });
 
 test("audit roots recurse and committed file filters use the reviewed Git object", () => {

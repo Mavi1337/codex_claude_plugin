@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { ensureCoordinatorSession, shutdownCoordinatorSession } from "../plugins/codex/scripts/lib/worker-coordinator-lifecycle.mjs";
+import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 const SCRIPT = path.resolve("plugins/codex/scripts/codex-workers.mjs");
 const SESSION_HOOK = path.resolve("plugins/codex/scripts/session-lifecycle-hook.mjs");
@@ -14,6 +15,15 @@ function invoke(args, options) {
   const result = run("node", [SCRIPT, ...args, "--json"], options);
   const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : null;
   return { ...result, parsed };
+}
+
+function waitForReview(reviewId, repo, env) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const observed = invoke(["review", "status", "--cwd", repo, "--review", reviewId], { cwd: repo, env });
+    if (observed.parsed?.result?.status !== "running") return observed;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  throw new Error(`Timed out waiting for review ${reviewId}.`);
 }
 
 test("worker CLI lazily starts one authenticated coordinator and resumes the same thread", async (t) => {
@@ -69,6 +79,11 @@ test("simultaneous coordinator discovery publishes one live owner", async (t) =>
   ]);
   assert.equal(first.pid, second.pid);
   assert.equal(first.tokenFile, second.tokenFile);
+  fs.writeFileSync(first.metadataFile, "{corrupt", "utf8");
+  const recovered = await ensureCoordinatorSession(repo, { dataRoot, env });
+  assert.equal(recovered.pid, first.pid);
+  assert.equal(fs.existsSync(parseBrokerEndpoint(recovered.endpoint).path), true);
+  assert.equal(JSON.parse(fs.readFileSync(recovered.metadataFile, "utf8")).pid, first.pid);
 });
 
 test("worker CLI rejects an unsafe explicit ID before contacting the coordinator", () => {
@@ -112,8 +127,9 @@ test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
 
-  const reviewed = invoke(["review", "start", "--cwd", repo, "--review", "review-1", "--orchestration", "orch-1", "--worktree", "--effort", "xhigh"], { cwd: repo, env });
-  assert.equal(reviewed.status, 0, reviewed.stderr);
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-1", "--orchestration", "orch-1", "--worktree", "--effort", "xhigh"], { cwd: repo, env });
+  assert.equal(accepted.parsed.result.status, "running");
+  const reviewed = waitForReview("review-1", repo, env);
   assert.equal(reviewed.parsed.result.gate.status, "pass");
   assert.equal(reviewed.parsed.result.specVerdict, "pass");
   assert.equal(reviewed.parsed.result.qualityVerdict, "approve");
@@ -140,8 +156,9 @@ test("oversized Sol review runs bounded passes and a fresh xhigh synthesis", (t)
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
 
-  const reviewed = invoke(["review", "start", "--cwd", repo, "--review", "review-split", "--orchestration", "orch-1", "--worktree", "--max-input-tokens", "2000"], { cwd: repo, env });
-  assert.equal(reviewed.status, 0, reviewed.stderr);
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-split", "--orchestration", "orch-1", "--worktree", "--max-input-tokens", "2000"], { cwd: repo, env });
+  assert.equal(accepted.parsed.result.status, "running");
+  const reviewed = waitForReview("review-split", repo, env);
   assert.ok(reviewed.parsed.result.passCount >= 2);
   assert.equal(reviewed.parsed.result.synthesized, true);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
@@ -161,7 +178,7 @@ test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed co
   installFakeCodex(binDir, "review-ok");
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-task", "--orchestration", "orch-1", "--allowed-path", "app.js"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-task", "--orchestration", "orch-1", "--allowed-path", "app.js", "--requirement", "app.js"], { cwd: repo, env });
   const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-task", "--prompt", "Implement app.js and verify it", "--idempotency-key", "task-send"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
   const waited = invoke(["worker", "wait", "--cwd", repo, "--worker", "luna-task", "--timeout", "2000"], { cwd: repo, env });
@@ -170,11 +187,14 @@ test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed co
 
   const committed = invoke(["integration", "commit", "--cwd", repo, "--worker", "luna-task", "--message", "task: implement", "--allowed-path", "app.js"], { cwd: repo, env });
   assert.equal(committed.status, 0, committed.stderr);
-  const reviewed = invoke(["review", "start", "--cwd", repo, "--review", "task-review", "--orchestration", "orch-1", "--worker", "luna-task", "--task-review"], { cwd: repo, env });
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "task-review", "--orchestration", "orch-1", "--worker", "luna-task", "--task-review"], { cwd: repo, env });
+  assert.equal(accepted.parsed.result.status, "running");
+  const reviewed = waitForReview("task-review", repo, env);
   assert.equal(reviewed.parsed.result.gate.status, "pass");
   const reviewPackage = fs.readFileSync(reviewed.parsed.result.packageFile, "utf8");
   assert.match(reviewPackage, /Binding task brief/);
   assert.match(reviewPackage, /Validated Luna implementation report/);
+  assert.match(reviewPackage, /Binding requirement and specification sources/);
   assert.match(reviewPackage, /Implement app\.js and verify it/);
   const applied = invoke(["integration", "apply", "--cwd", repo, "--worker", "luna-task", "--expected-head", base], { cwd: repo, env });
   assert.equal(applied.status, 0, applied.stderr);
