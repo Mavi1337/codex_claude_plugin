@@ -113,3 +113,20 @@ test("coordinator is the trusted commit authority for Luna worktrees", async () 
   assert.equal(committed.paths[0], "app.js");
   assert.equal(coordinator.status("luna-commit").headCommit, committed.commit);
 });
+
+test("coordinator restart marks in-flight work indeterminate and resumes the saved thread", async () => {
+  const cwd = makeTempDir("coordinator-restart-");
+  const dataRoot = makeTempDir("coordinator-data-");
+  initGitRepo(cwd);
+  const first = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => new FakeClient() });
+  const started = await first.startWorker({ workerId: "luna-restart", orchestrationId: "orch-1", cwd, role: "luna", isolated: false });
+  await first.send("luna-restart", "work", "send-restart");
+
+  const second = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => new FakeClient() });
+  const crashed = second.status("luna-restart");
+  assert.equal(crashed.supervisorStatus, "crashed");
+  assert.equal(crashed.turn.status, "indeterminate");
+  const resumed = await second.dispatch("worker.resume", { workerId: "luna-restart" }, "resume-restart");
+  assert.equal(resumed.thread.id, started.thread.id);
+  assert.equal(resumed.supervisorStatus, "online");
+});

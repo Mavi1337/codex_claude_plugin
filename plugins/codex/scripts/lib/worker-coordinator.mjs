@@ -37,6 +37,23 @@ export class WorkerCoordinator {
     this.waiters = new Map();
     this.activeTurns = 0;
     this.pumping = false;
+    const persisted = this.store.load();
+    const recoverable = Object.values(persisted.workers).filter((worker) => worker.supervisorStatus === "online");
+    if (recoverable.length) {
+      this.store.transaction((state) => {
+        for (const worker of Object.values(state.workers)) {
+          if (worker.supervisorStatus !== "online") continue;
+          worker.supervisorStatus = "crashed";
+          worker.thread.status = "unavailable";
+          if (worker.turn && ["queued", "running", "waiting-input", "waiting-approval"].includes(worker.turn.status)) {
+            worker.turn.status = "indeterminate";
+            worker.turn.error = "Coordinator transport was lost; retry explicitly from the resumed thread.";
+          }
+          if (worker.pendingRequest?.status === "pending") worker.pendingRequest.status = "cancelled";
+        }
+        state.queue = [];
+      });
+    }
   }
 
   async dispatch(operation, params, idempotencyKey) {
@@ -109,7 +126,7 @@ export class WorkerCoordinator {
     const workerId = assertSafeId(options.workerId, "workerId");
     const orchestrationId = assertSafeId(options.orchestrationId, "orchestrationId");
     const existing = this.store.load().workers[workerId];
-    if (existing && existing.supervisorStatus !== "closed") throw new Error(`Worker ${workerId} already exists.`);
+    if (existing && !["closed", "crashed"].includes(existing.supervisorStatus)) throw new Error(`Worker ${workerId} already exists.`);
     const role = options.role ?? "luna";
     const profile = role === "sol"
       ? {
@@ -148,11 +165,13 @@ export class WorkerCoordinator {
       : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: profile.config });
     const record = {
       id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
-      branch: worktree?.branch ?? null, baseCommit: worktree?.base ?? null,
+      branch: worktree?.branch ?? existing?.branch ?? null,
+      baseCommit: worktree?.base ?? existing?.baseCommit ?? null,
       model: profile.model,
       effort: profile.effort, sandbox: profile.sandbox, approvalPolicy: profile.approvalPolicy,
       supervisorStatus: "online", thread: { id: response.thread.id, status: "ready" },
-      turn: null, pendingRequest: null, createdAt: nowIso(), updatedAt: nowIso()
+      headCommit: existing?.headCommit ?? null, tree: existing?.tree ?? null,
+      turn: null, pendingRequest: null, createdAt: existing?.createdAt ?? nowIso(), updatedAt: nowIso()
     };
     this.clients.set(workerId, client);
     this.store.transaction((state) => { state.workers[workerId] = record; });

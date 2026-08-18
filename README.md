@@ -264,6 +264,36 @@ Then check in with:
 /codex:result
 ```
 
+### Implement a Plan with Luna and Sol
+
+```bash
+/codex:develop docs/superpowers/plans/my-feature.md
+```
+
+Claude remains the controller while the plugin creates isolated task worktrees,
+runs persistent `gpt-5.6-luna` workers at `xhigh`, creates trusted Git commits,
+and gates each task through a fresh read-only `gpt-5.6-sol` review. The runtime
+supports up to five concurrent inference turns, explicit follow-up messages,
+blocking approval/input callbacks, stop/close, and later thread resumption.
+
+The command previews task count, concurrency, model effort, and final-review
+choice before dispatch. It never merges to `main`, pushes, or publishes.
+
+Run a standalone flexible Sol review with one target:
+
+```bash
+/codex:sol-review --base main
+/codex:sol-review --worktree
+/codex:sol-review --staged
+/codex:sol-review --last 5
+/codex:sol-review --range abc123..def456 --path src/auth
+/codex:sol-review --audit-path src/payments
+```
+
+Review reports and immutable package manifests are stored as canonical files.
+Oversized packages split into bounded passes and a fresh xhigh synthesis instead
+of being silently truncated.
+
 ## Codex Integration
 
 The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
@@ -308,6 +338,11 @@ That means:
 - it uses the same Codex install you would use directly
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
+
+Interactive development workers use dedicated headless app-server processes
+owned by one repository coordinator. They still use the same local Codex binary,
+authentication, and configuration; they are not containers or copies of Codex.
+Luna receives an isolated Git worktree, while Sol remains read-only.
 
 ### Will it use the same Codex config I already have?
 
