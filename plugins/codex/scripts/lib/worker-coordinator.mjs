@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { CodexAppServerClient } from "./app-server.mjs";
 import { assertSafeId } from "./worker-protocol.mjs";
 import { createWorkerStore } from "./worker-state.mjs";
+import { applyReviewedCommits, commitTaskWorktree, createTaskWorktree } from "./worker-worktree.mjs";
 
 const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitation/request"]);
 const APPROVAL_METHODS = new Set([
@@ -43,10 +44,38 @@ export class WorkerCoordinator {
       case "worker.close": result = await this.close(params.workerId); break;
       case "worker.resume": {
         const record = this.status(params.workerId);
-        result = await this.startWorker({ ...record, workerId: record.id, threadId: record.thread.id, cwd: record.cwd });
+        result = await this.startWorker({
+          ...record,
+          workerId: record.id,
+          threadId: record.thread.id,
+          cwd: record.integrationCwd ?? record.cwd,
+          workerCwd: record.cwd,
+          isolated: false
+        });
         break;
       }
       case "worker.resolve-request": return this.resolveRequest(params.requestId, params.result, idempotencyKey);
+      case "integration.commit": {
+        const worker = this.status(params.workerId);
+        if (worker.role !== "luna") throw new Error("Only Luna implementation workers have task worktrees to commit.");
+        result = commitTaskWorktree(worker.cwd, { message: params.message, allowedPaths: params.allowedPaths });
+        this.store.transaction((state) => {
+          state.workers[params.workerId].headCommit = result.commit;
+          state.workers[params.workerId].tree = result.tree;
+        });
+        break;
+      }
+      case "integration.apply": {
+        const worker = this.status(params.workerId);
+        if (worker.reviewGate !== "pass") throw new Error("Worker changes have not passed the Sol review gate.");
+        result = applyReviewedCommits({
+          integrationCwd: worker.integrationCwd,
+          expectedHead: params.expectedHead,
+          base: worker.baseCommit,
+          head: worker.headCommit
+        });
+        break;
+      }
       case "coordinator.status": result = {
         status: "online", repositoryId: this.store.identity.repositoryId,
         activeTurns: this.activeTurns, queuedTurns: this.store.load().queue.length,
@@ -68,14 +97,27 @@ export class WorkerCoordinator {
     const profile = role === "sol"
       ? { model: "gpt-5.6-sol", effort: options.effort ?? "high", sandbox: "read-only", approvalPolicy: "never", ephemeral: true }
       : { model: "gpt-5.6-luna", effort: "xhigh", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false };
-    const client = await this.clientFactory(options.cwd, { role, profile });
+    let workerCwd = options.workerCwd ?? options.cwd;
+    let worktree = null;
+    if (role === "luna" && options.isolated !== false) {
+      worktree = createTaskWorktree({
+        repoRoot: options.cwd,
+        workerId,
+        base: options.base ?? "HEAD",
+        worktreeRoot: options.worktreeRoot ?? this.store.artifactPath(orchestrationId, "worktrees")
+      });
+      workerCwd = worktree.worktree;
+    }
+    const client = await this.clientFactory(workerCwd, { role, profile });
     client.setNotificationHandler((message) => this.#handleNotification(workerId, message));
     client.setServerRequestHandler((message) => this.#handleServerRequest(workerId, message));
     const response = options.threadId
-      ? await client.request("thread/resume", { threadId: options.threadId, cwd: options.cwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox })
-      : await client.request("thread/start", { cwd: options.cwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral });
+      ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox })
+      : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral });
     const record = {
-      id: workerId, orchestrationId, role, cwd: options.cwd, model: profile.model,
+      id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
+      branch: worktree?.branch ?? null, baseCommit: worktree?.base ?? null,
+      model: profile.model,
       effort: profile.effort, sandbox: profile.sandbox, approvalPolicy: profile.approvalPolicy,
       supervisorStatus: "online", thread: { id: response.thread.id, status: "ready" },
       turn: null, pendingRequest: null, createdAt: nowIso(), updatedAt: nowIso()

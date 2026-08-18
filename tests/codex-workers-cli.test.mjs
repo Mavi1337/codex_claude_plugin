@@ -19,6 +19,9 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
   const dataRoot = makeTempDir("worker-cli-data-");
   const binDir = makeTempDir("worker-cli-bin-");
   initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
   installFakeCodex(binDir, "review-ok");
   const env = {
     ...process.env,
@@ -33,6 +36,8 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
   assert.equal(started.status, 0, started.stderr);
   assert.equal(started.parsed.result.model, "gpt-5.6-luna");
   assert.equal(started.parsed.result.effort, "xhigh");
+  assert.notEqual(started.parsed.result.cwd, repo);
+  assert.equal(fs.existsSync(started.parsed.result.cwd), true);
 
   const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-1", "--prompt", "Inspect the task", "--idempotency-key", "send-1"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
