@@ -29,8 +29,15 @@ integration.
 | Trusted commit | `integration commit --worker ID --message TEXT --allowed-path PATH...` |
 | Task review | `review start --review ID --orchestration ID --worker ID --task-review` |
 | Flexible review | `review start --review ID --orchestration ID` plus one target |
-| Controller ruling | `review rule --review ID --reason TEXT [--waive-cannot-verify]` |
+| Controller ruling on a review | `review rule --review ID --reason TEXT [--waive-cannot-verify]` |
+| Controller ruling without a review | `integration rule --worker ID --reason TEXT` |
 | Integrate | `integration apply --worker ID --expected-head OID` |
+| Reload edited plugin code | `coordinator restart` |
+
+`--allowed-path` accepts files or directories; a directory covers everything
+beneath it, and a rename is inside the assignment only when both its source and
+destination are covered. The paths passed to `integration commit` must still
+match the worker's `worker start` assignment exactly.
 
 Review targets are `--base REF`, `--range A..B`, `--last N`, `--worktree`,
 `--staged`, `--unstaged`, repeated `--path`/`--file`, or repeated
@@ -58,3 +65,36 @@ high. Reports are returned as canonical file paths.
 - Only apply after the returned review gate is `pass`, using the integration
   HEAD captured immediately before the operation. The runtime rechecks the
   reviewed package hash and exact base/head/tree under the integration lease.
+- When the user opts out of Sol reviews entirely, `integration rule --worker ID
+  --reason TEXT` records an explicit controller ruling in the ledger and binds
+  the exact committed base/head/tree, which `integration apply` then honours.
+  Ask the user before ruling; a ruling replaces independent review, so say so.
+  Any later `integration commit` invalidates the ruling, exactly as it
+  invalidates a Sol binding.
+
+## Observing a long turn
+
+- `worker wait --worker ID --timeout 0` blocks until the turn leaves
+  `queued`/`running` with no deadline of its own. Run it as one background
+  command rather than polling: the controller is re-invoked once when it exits,
+  and each poll would otherwise cost context.
+- A failed turn reports `turnError` at the head of the `wait`/`status` payload
+  as well as in `turn.error`. Read it before assuming the worker misbehaved —
+  an API rejection surfaces here.
+- Luna narrates progress while still running. Treat only a terminal turn status
+  as completion, never the text of `lastOutput`.
+
+## Environment the worker will not have
+
+- A task worktree is created from a commit, so untracked, ignored, and
+  uncommitted files — `.venv`, `.env`, generated data — are absent. `worker
+  start` returns `absentInputs` listing what the integration checkout holds and
+  the worktree will not.
+- Put absolute interpreter, environment, and data paths in the brief, and pass
+  repository agent instructions (`CLAUDE.md`, `AGENTS.md`) with `--requirement`.
+
+## After editing the plugin
+
+The coordinator is a daemon that loads schemas, prompts, and its module graph
+once at startup. After changing plugin files run `coordinator restart`, then
+`worker resume --worker ID` before the next `worker send`.
