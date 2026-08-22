@@ -7,13 +7,14 @@ import {
   ensureCoordinatorSession,
   restartCoordinatorSession,
   sendCoordinatorRequest,
-  shutdownCoordinatorSession
+  shutdownCoordinatorSession,
+  waitForWorker
 } from "./lib/worker-coordinator-lifecycle.mjs";
 
 function parse(argv) {
   const positionals = [];
   const options = {};
-  const booleans = new Set(["json", "worktree", "staged", "unstaged", "task-review", "waive-cannot-verify"]);
+  const booleans = new Set(["json", "force", "worktree", "staged", "unstaged", "task-review", "waive-cannot-verify"]);
   const repeatable = new Set(["path", "file", "audit-path", "allowed-path", "requirement"]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
@@ -45,10 +46,10 @@ async function main() {
   resolveRepositoryIdentity(cwd);
 
   if (group === "coordinator" && action === "shutdown") {
-    return shutdownCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA });
+    return shutdownCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA, force: options.force === true });
   }
   if (group === "coordinator" && action === "restart") {
-    return restartCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA, env: process.env });
+    return restartCoordinatorSession(cwd, { dataRoot: process.env.CLAUDE_PLUGIN_DATA, env: process.env, force: options.force === true });
   }
 
   let operation;
@@ -120,6 +121,13 @@ async function main() {
     }
   } else {
     throw new Error(`Unknown command group: ${group}.`);
+  }
+
+  if (action === "wait") {
+    return waitForWorker(cwd, params, {
+      dataRoot: process.env.CLAUDE_PLUGIN_DATA,
+      env: process.env
+    });
   }
 
   const session = await ensureCoordinatorSession(cwd, {

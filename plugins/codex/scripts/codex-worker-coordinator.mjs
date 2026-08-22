@@ -70,6 +70,7 @@ server.listen(target.path, () => {
 });
 
 async function shutdown() {
+  coordinator.flushWaiters("restarting");
   server.close();
   await Promise.allSettled(coordinator.list().map((worker) => coordinator.close(worker.id)));
   if (target.kind === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.path);

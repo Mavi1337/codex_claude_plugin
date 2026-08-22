@@ -12,6 +12,11 @@ import { createWorkerStore } from "./worker-state.mjs";
 import { MAX_FRAME_BYTES } from "./worker-protocol.mjs";
 
 const COORDINATOR_SCRIPT = fileURLToPath(new URL("../codex-worker-coordinator.mjs", import.meta.url));
+const WAIT_SLICE_MS = 30_000;
+const RECONNECT_MIN_MS = 250;
+const RECONNECT_MAX_MS = 2_000;
+const TERMINAL_WAIT_STATUSES = new Set(["completed", "failed", "interrupted", "indeterminate", "waiting-input", "waiting-approval"]);
+const RECOVERABLE_WAIT_ERRORS = new Set(["ECONNREFUSED", "ENOENT", "EPIPE", "ECONNRESET", "ECONNABORTED", "ERR_STREAM_DESTROYED", "ETIMEDOUT"]);
 
 function writePrivate(file, value) {
   fs.writeFileSync(file, value, { encoding: "utf8", mode: 0o600 });
@@ -56,37 +61,115 @@ export async function sendCoordinatorRequest(session, operation, params = {}, op
     const socket = net.createConnection({ path: target.path });
     socket.setEncoding("utf8");
     let buffer = "";
+    let settled = false;
+    let timer = null;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback(value);
+    };
     // A timeout of 0 means "block indefinitely" — `worker wait --timeout 0` blocks until the turn
     // reaches a terminal state, so the transport must not impose a deadline of its own.
     const budget = options.timeoutMs ?? 10000;
-    const timer = budget > 0
+    timer = budget > 0
       ? setTimeout(() => {
+        const error = Object.assign(new Error("Timed out waiting for worker coordinator."), { code: "ETIMEDOUT" });
+        settle(reject, error);
         socket.destroy();
-        reject(new Error("Timed out waiting for worker coordinator."));
       }, budget)
       : null;
     socket.on("connect", () => socket.write(`${JSON.stringify(envelope)}\n`));
     socket.on("data", (chunk) => {
       buffer += chunk;
       if (Buffer.byteLength(buffer) > MAX_FRAME_BYTES) {
-        clearTimeout(timer);
+        const error = new Error("Worker coordinator response exceeded the maximum frame size.");
+        error.code = "FRAME_TOO_LARGE";
+        settle(reject, error);
         socket.destroy();
-        reject(new Error("Worker coordinator response exceeded the maximum frame size."));
         return;
       }
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
-      clearTimeout(timer);
       socket.end();
       try {
         const response = JSON.parse(buffer.slice(0, newline));
         if (response.version !== 1 || response.requestId !== requestId) throw new Error("Worker coordinator returned a mismatched protocol response.");
-        if (response.error) reject(Object.assign(new Error(response.error.message), { code: response.error.code }));
-        else resolve(response);
-      } catch (error) { reject(error); }
+        if (response.error) settle(reject, Object.assign(new Error(response.error.message), { code: response.error.code }));
+        else settle(resolve, response);
+      } catch (error) { settle(reject, error); }
     });
-    socket.on("error", (error) => { clearTimeout(timer); reject(error); });
+    socket.on("error", (error) => settle(reject, error));
+    socket.on("close", () => {
+      if (settled) return;
+      settle(reject, Object.assign(new Error("Worker coordinator connection closed before a response."), { code: "ECONNRESET" }));
+    });
   });
+}
+
+function isRecoverableWaitError(error) {
+  return RECOVERABLE_WAIT_ERRORS.has(error?.code);
+}
+
+function waitResultIsTerminal(response) {
+  return TERMINAL_WAIT_STATUSES.has(response?.result?.turn?.status);
+}
+
+function waitSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function waitForWorker(cwd, params, options = {}) {
+  const requestedTimeoutMs = Number(params.timeoutMs) > 0 ? Number(params.timeoutMs) : 0;
+  const sessionOptions = { dataRoot: options.dataRoot, env: options.env };
+  let session = await ensureCoordinatorSession(cwd, sessionOptions);
+  const deadline = requestedTimeoutMs > 0 ? Date.now() + requestedTimeoutMs : null;
+  let lastResponse = null;
+  let retryDelay = RECONNECT_MIN_MS;
+
+  while (true) {
+    const remaining = deadline === null ? WAIT_SLICE_MS : deadline - Date.now();
+    if (remaining <= 0) {
+      if (lastResponse) return lastResponse;
+      throw Object.assign(new Error("Timed out waiting for worker coordinator."), { code: "ETIMEDOUT" });
+    }
+    const sliceMs = Math.max(1, Math.min(WAIT_SLICE_MS, remaining));
+    const requestId = `wait-${randomUUID()}`;
+    try {
+      const response = await sendCoordinatorRequest(session, "worker.wait", { ...params, timeoutMs: sliceMs }, {
+        requestId,
+        idempotencyKey: requestId,
+        timeoutMs: sliceMs + 1000
+      });
+      lastResponse = response;
+      if (waitResultIsTerminal(response)) return response;
+      if (deadline !== null && Date.now() >= deadline) return response;
+      if (response.result?.coordinator === "restarting") {
+        await waitSleep(retryDelay);
+        try {
+          session = await ensureCoordinatorSession(cwd, sessionOptions);
+          retryDelay = RECONNECT_MIN_MS;
+        } catch {
+          retryDelay = Math.min(RECONNECT_MAX_MS, retryDelay * 2);
+        }
+      } else {
+        retryDelay = RECONNECT_MIN_MS;
+      }
+    } catch (error) {
+      if (!isRecoverableWaitError(error)) throw error;
+      if (deadline !== null && Date.now() >= deadline) {
+        if (lastResponse) return lastResponse;
+        throw error;
+      }
+      await waitSleep(retryDelay);
+      try {
+        session = await ensureCoordinatorSession(cwd, sessionOptions);
+        retryDelay = RECONNECT_MIN_MS;
+      } catch {
+        retryDelay = Math.min(RECONNECT_MAX_MS, retryDelay * 2);
+      }
+    }
+  }
 }
 
 async function sessionIsReady(session) {
@@ -268,6 +351,7 @@ export async function ensureCoordinatorSession(cwd, options = {}) {
 // down, waits for the process to actually exit, and starts a fresh one.
 export async function restartCoordinatorSession(cwd, options = {}) {
   const previous = loadCoordinatorSession(cwd, options);
+  if (previous && !options.force) assertCoordinatorIdle(await probeCoordinator(previous), "restart");
   const stopped = await shutdownCoordinatorSession(cwd, options);
   if (previous?.pid) {
     const deadline = Date.now() + 5000;
@@ -283,9 +367,21 @@ export async function restartCoordinatorSession(cwd, options = {}) {
 export async function shutdownCoordinatorSession(cwd, options = {}) {
   const session = loadCoordinatorSession(cwd, options);
   if (!session) return { status: "not-running" };
+  if (!options.force) assertCoordinatorIdle(await probeCoordinator(session), "shutdown");
   try {
     return (await sendCoordinatorRequest(session, "coordinator.shutdown", {}, { timeoutMs: 1000 })).result;
-  } catch {
+  } catch (error) {
+    if (error.code === "COORDINATOR_BUSY") throw error;
     return { status: "not-running" };
   }
+}
+
+function assertCoordinatorIdle(response, operation) {
+  const result = response?.result;
+  const activeTurns = Number(result?.activeTurns ?? 0);
+  const activeWaiters = Number(result?.activeWaiters ?? 0);
+  if (!result || (activeTurns <= 0 && activeWaiters <= 0)) return;
+  const details = (result.activeWorkers ?? []).map((worker) => `${worker.workerId} (${worker.orchestrationId})`).join(", ");
+  const suffix = details ? `: ${details}.` : ".";
+  throw Object.assign(new Error(`Cannot ${operation} the worker coordinator while work is active${suffix} Use --force to continue.`), { code: "COORDINATOR_BUSY" });
 }

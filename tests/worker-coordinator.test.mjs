@@ -278,6 +278,25 @@ test("worker thread requests override a globally pinned reasoning effort on star
   assert.deepEqual(clients[1].threadRequests[0].params.config, clients[0].threadRequests[0].params.config);
 });
 
+test("coordinator shutdown flushes blocking waiters with a restart marker", async () => {
+  const cwd = makeTempDir("coordinator-shutdown-wait-");
+  const dataRoot = makeTempDir("coordinator-shutdown-wait-data-");
+  initGitRepo(cwd);
+  const coordinator = new WorkerCoordinator({ cwd, dataRoot, clientFactory: async () => new FakeClient() });
+  await coordinator.startWorker({ workerId: "luna-shutdown-wait", orchestrationId: "orch-1", cwd, role: "luna", isolated: false });
+  await coordinator.send("luna-shutdown-wait", "work", "send-shutdown-wait");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const waiting = coordinator.wait("luna-shutdown-wait");
+  await coordinator.dispatch("coordinator.shutdown", {}, "shutdown-wait");
+  const result = await Promise.race([
+    waiting,
+    new Promise((resolve) => setTimeout(() => resolve(null), 100))
+  ]);
+  assert.equal(result?.coordinator, "restarting");
+  assert.equal(coordinator.waiters.size, 0);
+});
+
 test("controller ruling can explicitly waive cannot-verify but not failed quality", async () => {
   const cwd = makeTempDir("coordinator-");
   const dataRoot = makeTempDir("coordinator-data-");

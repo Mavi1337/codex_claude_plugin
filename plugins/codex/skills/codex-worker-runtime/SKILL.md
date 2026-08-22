@@ -32,7 +32,7 @@ integration.
 | Controller ruling on a review | `review rule --review ID --reason TEXT [--waive-cannot-verify]` |
 | Controller ruling without a review | `integration rule --worker ID --reason TEXT` |
 | Integrate | `integration apply --worker ID --expected-head OID` |
-| Reload edited plugin code | `coordinator restart` |
+| Reload edited plugin code | `coordinator restart [--force]` |
 
 `--allowed-path` accepts files or directories; a directory covers everything
 beneath it, and a rename is inside the assignment only when both its source and
@@ -76,8 +76,9 @@ high. Reports are returned as canonical file paths.
 
 - `worker wait --worker ID --timeout 0` blocks until the turn leaves
   `queued`/`running` with no deadline of its own. Run it as one background
-  command rather than polling: the controller is re-invoked once when it exits,
-  and each poll would otherwise cost context.
+  command rather than polling: the client uses bounded slices and reconnects
+  after a shared coordinator disruption. A forced coordinator restart still
+  requires `worker resume --worker ID` before the next `worker send`.
 - A failed turn reports `turnError` at the head of the `wait`/`status` payload
   as well as in `turn.error`. Read it before assuming the worker misbehaved —
   an API rejection surfaces here.
@@ -96,5 +97,6 @@ high. Reports are returned as canonical file paths.
 ## After editing the plugin
 
 The coordinator is a daemon that loads schemas, prompts, and its module graph
-once at startup. After changing plugin files run `coordinator restart`, then
-`worker resume --worker ID` before the next `worker send`.
+once at startup. After changing plugin files run `coordinator restart`; it
+refuses to disrupt live turns or waits unless `--force` is explicit. After a
+forced restart, run `worker resume --worker ID` before the next `worker send`.

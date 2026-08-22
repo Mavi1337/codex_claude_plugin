@@ -24,6 +24,7 @@ const WORKER_SCHEMA_URL = new URL("../../schemas/worker-turn-output.schema.json"
 const LUNA_PROMPT_URL = new URL("../../prompts/luna-implementer.md", import.meta.url);
 
 const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitation/request"]);
+const ACTIVE_TURN_STATUSES = new Set(["queued", "running", "waiting-input", "waiting-approval"]);
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
@@ -397,9 +398,10 @@ export class WorkerCoordinator {
         status: "online", repositoryId: this.store.identity.repositoryId,
         coordinatorPid: process.pid, integrationCwd: this.cwd,
         activeTurns: this.activeTurns, queuedTurns: this.store.load().queue.length,
+        activeWaiters: this.waiterCount(), activeWorkers: this.activeWorkerDetails(),
         workerCount: this.list().length, maxConcurrent: this.maxConcurrent
       }; break;
-      case "coordinator.shutdown": result = { status: "shutting-down" }; break;
+      case "coordinator.shutdown": this.flushWaiters("restarting"); result = { status: "shutting-down" }; break;
       default: throw new Error(`Unsupported worker operation: ${operation}.`);
     }
     this.store.transaction((state) => { state.idempotency[idempotencyKey] = result; });
@@ -792,6 +794,28 @@ export class WorkerCoordinator {
     });
   }
 
+  waiterCount() {
+    return [...this.waiters.values()].reduce((count, waiters) => count + waiters.length, 0);
+  }
+
+  activeWorkerDetails() {
+    const waitingWorkerIds = new Set([...this.waiters.entries()]
+      .filter(([, waiters]) => waiters.length > 0)
+      .map(([workerId]) => workerId));
+    return this.list()
+      .filter((worker) => waitingWorkerIds.has(worker.id) || ACTIVE_TURN_STATUSES.has(worker.turn?.status))
+      .map((worker) => ({
+        workerId: worker.id,
+        orchestrationId: worker.orchestrationId,
+        turnStatus: worker.turn?.status ?? null,
+        waiters: this.waiters.get(worker.id)?.length ?? 0
+      }));
+  }
+
+  flushWaiters(marker = "restarting") {
+    for (const workerId of this.waiters.keys()) this.#notifyWaiters(workerId, marker);
+  }
+
   resolveRequest(requestId, result, idempotencyKey) {
     assertSafeId(requestId, "requestId");
     assertSafeId(idempotencyKey, "idempotencyKey");
@@ -1044,8 +1068,9 @@ export class WorkerCoordinator {
     void this.#pump();
   }
 
-  #notifyWaiters(workerId) {
+  #notifyWaiters(workerId, marker = null) {
     const current = this.status(workerId);
+    if (marker) current.coordinator = marker;
     for (const waiter of this.waiters.get(workerId) ?? []) {
       if (waiter.timer) clearTimeout(waiter.timer);
       waiter.resolve(current);

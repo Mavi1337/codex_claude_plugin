@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,6 +17,25 @@ function invoke(args, options) {
   const result = run("node", [SCRIPT, ...args, "--json"], options);
   const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : null;
   return { ...result, parsed };
+}
+
+function invokeAsync(args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [SCRIPT, ...args, "--json"], options);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status, signal) => {
+      let parsed = null;
+      try { parsed = stdout.trim() ? JSON.parse(stdout) : null; }
+      catch (error) { reject(Object.assign(error, { stdout, stderr, status, signal })); return; }
+      resolve({ status, signal, stdout, stderr, parsed });
+    });
+  });
 }
 
 function waitForReview(reviewId, repo, env) {
@@ -282,4 +302,65 @@ test("coordinator restart replaces the running daemon so edited plugin code is r
   assert.equal(second.status, 0, second.stderr);
   assert.notEqual(second.parsed.result.coordinatorPid, firstPid);
   assert.equal(second.parsed.result.status, "online");
+});
+
+test("worker wait reconnects after the shared coordinator is disrupted", async (t) => {
+  const repo = makeTempDir("worker-wait-reconnect-repo-");
+  const dataRoot = makeTempDir("worker-wait-reconnect-data-");
+  const binDir = makeTempDir("worker-wait-reconnect-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  installFakeCodex(binDir, "interruptible-slow-task");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo, "--force"], { cwd: repo, env }); });
+
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-reconnect", "--orchestration", "orch-reconnect"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-reconnect", "--prompt", "Long-running work", "--idempotency-key", "send-reconnect"], { cwd: repo, env });
+  assert.equal(sent.status, 0, sent.stderr);
+
+  const waiting = invokeAsync(["worker", "wait", "--cwd", repo, "--worker", "luna-reconnect", "--timeout", "0"], { cwd: repo, env });
+  let coordinatorPid = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const observed = invoke(["coordinator", "status", "--cwd", repo], { cwd: repo, env });
+    if (observed.parsed?.result?.activeWaiters > 0) {
+      coordinatorPid = observed.parsed.result.coordinatorPid;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(coordinatorPid);
+  process.kill(coordinatorPid, "SIGKILL");
+
+  const waited = await waiting;
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.ok(["interrupted", "indeterminate"].includes(waited.parsed.result.turn.status));
+});
+
+test("coordinator restart refuses live turns unless forced", (t) => {
+  const repo = makeTempDir("worker-restart-guard-repo-");
+  const dataRoot = makeTempDir("worker-restart-guard-data-");
+  const binDir = makeTempDir("worker-restart-guard-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  installFakeCodex(binDir, "interruptible-slow-task");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo, "--force"], { cwd: repo, env }); });
+
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-guard", "--orchestration", "orch-guard"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-guard", "--prompt", "Long-running work", "--idempotency-key", "send-guard"], { cwd: repo, env });
+  assert.equal(sent.status, 0, sent.stderr);
+
+  const refused = invoke(["coordinator", "restart", "--cwd", repo], { cwd: repo, env });
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /luna-guard.*orch-guard|orch-guard.*luna-guard/i);
+
+  const forced = invoke(["coordinator", "restart", "--cwd", repo, "--force"], { cwd: repo, env });
+  assert.equal(forced.status, 0, forced.stderr);
+  assert.equal(forced.parsed.status, "restarted");
 });
