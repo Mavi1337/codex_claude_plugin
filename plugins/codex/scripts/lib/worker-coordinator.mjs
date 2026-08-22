@@ -483,8 +483,8 @@ export class WorkerCoordinator {
     let response;
     try {
       response = options.threadId
-        ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: profile.config })
-        : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: profile.config });
+        ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: { ...(profile.config ?? {}), model_reasoning_effort: profile.effort } })
+        : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: { ...(profile.config ?? {}), model_reasoning_effort: profile.effort } });
     } catch (error) {
       await client.close().catch(() => {});
       if (worktree && !options.threadId) {

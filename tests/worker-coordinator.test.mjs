@@ -53,6 +53,22 @@ class DelayedReviewClient extends FakeClient {
   }
 }
 
+class GlobalEffortPinnedClient extends FakeClient {
+  constructor() {
+    super();
+    this.threadRequests = [];
+  }
+  async request(method, params) {
+    if (method === "thread/start" || method === "thread/resume") {
+      this.threadRequests.push({ method, params });
+      const response = await super.request(method, params);
+      response.reasoningEffort = params.config?.model_reasoning_effort ?? "xhigh";
+      return response;
+    }
+    return super.request(method, params);
+  }
+}
+
 test("transport loss durably marks a running worker indeterminate", async () => {
   const cwd = makeTempDir("coordinator-");
   const dataRoot = makeTempDir("coordinator-data-");
@@ -234,6 +250,32 @@ test("coordinator dispatch uses explicit operations and idempotency", async () =
   const listed = await coordinator.dispatch("worker.list", {}, "list-1");
   assert.deepEqual(listed.map((worker) => worker.id), ["sol-1"]);
   await assert.rejects(() => coordinator.dispatch("worker.unknown", {}, "bad-1"), /unsupported worker operation/i);
+});
+
+test("worker thread requests override a globally pinned reasoning effort on start and resume", async () => {
+  const cwd = makeTempDir("coordinator-effort-");
+  const dataRoot = makeTempDir("coordinator-effort-data-");
+  initGitRepo(cwd);
+  const clients = [];
+  const clientFactory = async () => {
+    const client = new GlobalEffortPinnedClient();
+    clients.push(client);
+    return client;
+  };
+  const first = new WorkerCoordinator({ cwd, dataRoot, clientFactory });
+  const started = await first.startWorker({
+    workerId: "sol-pinned", orchestrationId: "orch-1", cwd, role: "sol"
+  });
+  assert.deepEqual(clients[0].threadRequests[0].params.config, {
+    model_context_window: 258000,
+    model_auto_compact_token_limit: 220000,
+    model_reasoning_effort: "high"
+  });
+
+  const second = new WorkerCoordinator({ cwd, dataRoot, clientFactory });
+  await second.dispatch("worker.resume", { workerId: started.id }, "resume-sol-pinned");
+  assert.equal(clients[1].threadRequests[0].method, "thread/resume");
+  assert.deepEqual(clients[1].threadRequests[0].params.config, clients[0].threadRequests[0].params.config);
 });
 
 test("controller ruling can explicitly waive cannot-verify but not failed quality", async () => {
