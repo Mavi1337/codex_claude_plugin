@@ -38,6 +38,27 @@ function invokeAsync(args, options) {
   });
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function invokeWithEarlyStdoutClose(args, options) {
+  return new Promise((resolve, reject) => {
+    const cli = [process.execPath, SCRIPT, ...args, "--json"].map(shellQuote).join(" ");
+    const consumer = [
+      process.execPath,
+      "-e",
+      "let bytes = 0; process.stdin.on('data', (chunk) => { bytes += chunk.length; if (bytes >= 200) process.exit(0); });"
+    ].map(shellQuote).join(" ");
+    const child = spawn("bash", ["-o", "pipefail", "-c", `${cli} | ${consumer}`], options);
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status, signal) => resolve({ status, signal, stderr }));
+  });
+}
+
 function waitForReview(reviewId, repo, env) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const observed = invoke(["review", "status", "--cwd", repo, "--review", reviewId], { cwd: repo, env });
@@ -84,6 +105,30 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
   assert.equal(fakeState.lastTurnStart.outputSchema.properties.status.enum.includes("completed"), true);
   assert.match(fakeState.lastTurnStart.prompt, /do not run `git commit`/i);
   assert.equal(fs.existsSync(waited.parsed.result.reportFile), true);
+});
+
+test("worker CLI exits cleanly when stdout closes before JSON is consumed", async (t) => {
+  if (process.platform === "win32") t.skip("the regression uses bash pipefail");
+  const repo = makeTempDir("worker-stdout-epipe-repo-");
+  const dataRoot = makeTempDir("worker-stdout-epipe-data-");
+  const binDir = makeTempDir("worker-stdout-epipe-bin-");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+  run("git", ["add", "base.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }); });
+
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-epipe", "--orchestration", "orch-epipe"], { cwd: repo, env });
+  assert.equal(started.status, 0, started.stderr);
+  const store = createWorkerStore(repo, { dataRoot });
+  store.transaction((state) => { state.workers["luna-epipe"].lastOutput = "x".repeat(128 * 1024); });
+  const full = invoke(["worker", "status", "--cwd", repo, "--worker", "luna-epipe"], { cwd: repo, env });
+  assert.ok(full.stdout.length > 128 * 1024);
+  const closed = await invokeWithEarlyStdoutClose(["worker", "status", "--cwd", repo, "--worker", "luna-epipe"], { cwd: repo, env });
+  assert.equal(closed.status, 0, closed.stderr);
+  assert.doesNotMatch(closed.stderr, /EPIPE|Unhandled 'error' event|node:events/i);
 });
 
 test("simultaneous coordinator discovery publishes one live owner", async (t) => {

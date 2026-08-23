@@ -11,6 +11,16 @@ import {
   waitForWorker
 } from "./lib/worker-coordinator-lifecycle.mjs";
 
+function absorbBrokenPipe(stream) {
+  stream.on("error", (error) => {
+    if (error.code === "EPIPE") process.exit(0);
+    throw error;
+  });
+}
+
+absorbBrokenPipe(process.stdout);
+absorbBrokenPipe(process.stderr);
+
 function parse(argv) {
   const positionals = [];
   const options = {};
