@@ -21,7 +21,7 @@ integration.
 
 | Need | Operation and required options |
 |---|---|
-| Start Luna | `worker start --worker ID --orchestration ID --allowed-path PATH... --requirement FILE...` |
+| Start Luna | `worker start --worker ID --orchestration ID --allowed-path PATH... --requirement FILE... [--base REF]` |
 | Message | `worker send --worker ID --prompt TEXT --idempotency-key KEY` |
 | Observe | `worker wait\|status --worker ID`; `worker list` |
 | Blocking callback | `worker resolve-request --request ID --result-json JSON --idempotency-key KEY` |
@@ -38,6 +38,15 @@ integration.
 beneath it, and a rename is inside the assignment only when both its source and
 destination are covered. The paths passed to `integration commit` must still
 match the worker's `worker start` assignment exactly.
+
+A Luna worktree is branched from `--base`, defaulting to `HEAD` of the integration
+checkout. Pass `--base` when the task builds on work that is not on the
+integration branch yet — a sibling worker's branch, for instance. Without it a
+second worker cannot see the first one's commits, which is silent: the worker
+simply does not find the code the brief describes.
+
+The coordinator stays bound to the integration checkout. `--cwd` must always name
+that checkout; pointing it at a worktree is refused and is unrelated to `--base`.
 
 Review targets are `--base REF`, `--range A..B`, `--last N`, `--worktree`,
 `--staged`, `--unstaged`, repeated `--path`/`--file`, or repeated

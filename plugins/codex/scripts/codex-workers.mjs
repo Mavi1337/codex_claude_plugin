@@ -119,6 +119,7 @@ async function main() {
         cwd,
         role: options.role ?? "luna",
         effort: options.effort,
+        base: options.base,
         allowedPaths: options["allowed-path"],
         requirementPaths: options.requirement
       };
