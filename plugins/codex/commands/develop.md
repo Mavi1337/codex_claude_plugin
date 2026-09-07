@@ -11,8 +11,8 @@ Raw request:
 `$ARGUMENTS`
 
 Before dispatch, show the resolved task count, concurrency cap, Luna
-`gpt-5.6-luna/xhigh`, Sol task review `gpt-5.6-sol/high`, and whether an on-demand
-final `gpt-5.6-sol/xhigh` review is selected. Ask once for authorization unless
+and review models (`gpt-6-astra/low` unless `--effort` raises them), and whether
+an on-demand final review at a higher effort is selected. Ask once for authorization unless
 the user already explicitly authorized this exact run. Then continue through
 implementation, task review, fixes, and reviewed integration; do not stop after
 merely starting workers.

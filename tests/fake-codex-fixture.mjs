@@ -352,8 +352,7 @@ rl.on("line", (line) => {
           id: message.id,
           result: {
             data: BEHAVIOR === "missing-worker-models" ? [] : [
-              { id: "gpt-5.6-luna", model: "gpt-5.6-luna", supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "xhigh" }] },
-              { id: "gpt-5.6-sol", model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] }
+                            { id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "low" }, { reasoningEffort: "medium", description: "medium" }, { reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] }
             ],
             nextCursor: null
           }

@@ -33,6 +33,7 @@ if (target.kind === "unix" && fs.existsSync(target.path)) fs.unlinkSync(target.p
 
 const server = net.createServer((socket) => {
   socket.setEncoding("utf8");
+  socket.on("error", () => {});
   let buffer = "";
   socket.on("data", (chunk) => {
     buffer += chunk;

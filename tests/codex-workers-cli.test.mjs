@@ -88,8 +88,8 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
 
   const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-1", "--orchestration", "orch-1", "--role", "luna"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
-  assert.equal(started.parsed.result.model, "gpt-5.6-luna");
-  assert.equal(started.parsed.result.effort, "xhigh");
+  assert.equal(started.parsed.result.model, "gpt-6-astra");
+  assert.equal(started.parsed.result.effort, "low");
   assert.notEqual(started.parsed.result.cwd, repo);
   assert.equal(fs.existsSync(started.parsed.result.cwd), true);
 
@@ -219,7 +219,7 @@ test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t
   assert.equal(fs.existsSync(reviewed.parsed.result.reportFile), true);
 
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
-  assert.equal(state.lastTurnStart.model, "gpt-5.6-sol");
+  assert.equal(state.lastTurnStart.model, "gpt-6-astra");
   assert.equal(state.lastTurnStart.effort, "xhigh");
   assert.equal(state.lastThreadStart.config.model_context_window, 258000);
   assert.equal(state.lastThreadStart.config.model_auto_compact_token_limit, 220000);

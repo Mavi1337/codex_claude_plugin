@@ -448,11 +448,11 @@ export class WorkerCoordinator {
       ?? (role === "luna" ? snapshotRequirementFiles(this.store, orchestrationId, workerId, options.cwd, options.requirementPaths ?? []) : []);
     const profile = role === "sol"
       ? {
-          model: "gpt-5.6-sol", effort: options.effort ?? "high", sandbox: "read-only",
+          model: "gpt-6-astra", effort: options.effort ?? "low", sandbox: "read-only",
           approvalPolicy: "never", ephemeral: true,
           config: { model_context_window: 258000, model_auto_compact_token_limit: 220000 }
         }
-      : { model: "gpt-5.6-luna", effort: "xhigh", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false, config: null };
+      : { model: "gpt-6-astra", effort: options.effort ?? "low", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false, config: null };
     const client = await this.clientFactory(options.cwd, { role, profile });
     try {
       const models = await client.request("model/list", { includeHidden: true });
@@ -645,7 +645,7 @@ export class WorkerCoordinator {
         workerId: reviewWorkerId(reviewId, `p${index + 1}`),
         orchestrationId,
         cwd: path.dirname(item.file),
-        effort: params.taskReview ? "high" : (params.effort ?? "xhigh"),
+        effort: params.effort ?? "low",
         prompt: `${promptTemplate}\n\nUse only the immutable evidence in this package; do not inspect any live repository or external path.\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
         schema,
         idempotencyKey: `${idempotencyKey}-pass-${index + 1}`,
@@ -663,7 +663,7 @@ export class WorkerCoordinator {
       const synthesisTokens = Math.ceil(fs.statSync(synthesisFile).size / 4) + 1024;
       if (synthesisTokens > maxInputTokens) throw new Error("Sol synthesis evidence exceeds the configured input bound; narrow the review target.");
       const executed = await this.#executeReviewPass({
-        workerId: reviewWorkerId(reviewId, "synth"), orchestrationId, cwd: path.dirname(synthesisFile), effort: "xhigh",
+        workerId: reviewWorkerId(reviewId, "synth"), orchestrationId, cwd: path.dirname(synthesisFile), effort: params.effort ?? "low",
         prompt: `${promptTemplate}\n\nUse only ${synthesisFile}. Synthesize every bounded pass, preserve material findings, and fail cannot-verify if any coverage-map entry lacks a corresponding pass report.`,
         schema, idempotencyKey: `${idempotencyKey}-synthesis`, timeoutMs: params.timeoutMs,
         reviewId, passId: "synthesis"

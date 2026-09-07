@@ -229,7 +229,7 @@ test("worker development and flexible Sol review entrypoints are discoverable", 
   const runtimeSkill = read("skills/codex-worker-runtime/SKILL.md");
 
   assert.match(develop, /codex-worker-development/);
-  assert.match(develop, /task count.*concurrency.*gpt-5\.6-luna.*gpt-5\.6-sol/is);
+  assert.match(develop, /task count.*concurrency.*gpt-6-astra/is);
   assert.match(solReview, /codex-workers\.mjs/);
   assert.match(solReview, /branch|worktree|staged|unstaged|range|file|audit/i);
   assert.match(developmentSkill, /implementation plan is ready/i);

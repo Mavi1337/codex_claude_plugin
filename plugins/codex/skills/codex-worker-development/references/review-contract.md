@@ -1,7 +1,8 @@
 # Review contract
 
-Task reviews use fresh Sol/high turns. Final branch review and oversized-package
-synthesis use fresh Sol/xhigh turns. Sol is read-only and reviews an immutable,
+Every Sol turn — task review, final branch review, and oversized-package
+synthesis — is a fresh `gpt-6-astra` turn at effort `low` unless `--effort`
+names a higher one. Sol is read-only and reviews an immutable,
 hashed package.
 
 The gate passes only when specification verdict is `pass` and quality verdict is
@@ -19,7 +20,7 @@ Use one target per standalone review:
 
 For a task, use `--worker ID --task-review`; the coordinator derives the exact
 base/head and records the package hash. Oversized packages split into bounded
-passes and a fresh xhigh synthesis automatically.
+passes and a fresh synthesis turn automatically, at the same effort.
 
 Before handoff, offer an on-demand final review of the current branch against its
 base. The user may instead choose the worktree, last N commits, an explicit

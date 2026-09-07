@@ -17,8 +17,8 @@ class FakeClient {
   setServerRequestHandler(handler) { this.serverRequests = handler; }
   async request(method, params) {
     if (method === "model/list") return { data: [
-      { id: "gpt-5.6-luna", model: "gpt-5.6-luna", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] },
-      { id: "gpt-5.6-sol", model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] }
+      { id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] },
+      { id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] }
     ] };
     if (method === "thread/start") return { thread: { id: `thread-${params.cwd.split("/").pop()}` }, model: params.model, reasoningEffort: params.effort ?? null, cwd: params.cwd, approvalPolicy: params.approvalPolicy, sandbox: { type: params.sandbox === "workspace-write" ? "workspaceWrite" : "readOnly" } };
     if (method === "thread/resume") return { thread: { id: params.threadId }, model: params.model, reasoningEffort: params.effort ?? null, cwd: params.cwd, approvalPolicy: params.approvalPolicy, sandbox: { type: params.sandbox === "workspace-write" ? "workspaceWrite" : "readOnly" } };
@@ -246,7 +246,7 @@ test("coordinator dispatch uses explicit operations and idempotency", async () =
   const started = await coordinator.dispatch("worker.start", {
     workerId: "sol-1", orchestrationId: "orch-1", cwd, role: "sol"
   }, "start-sol-1");
-  assert.equal(started.model, "gpt-5.6-sol");
+  assert.equal(started.model, "gpt-6-astra");
   const listed = await coordinator.dispatch("worker.list", {}, "list-1");
   assert.deepEqual(listed.map((worker) => worker.id), ["sol-1"]);
   await assert.rejects(() => coordinator.dispatch("worker.unknown", {}, "bad-1"), /unsupported worker operation/i);
@@ -269,7 +269,7 @@ test("worker thread requests override a globally pinned reasoning effort on star
   assert.deepEqual(clients[0].threadRequests[0].params.config, {
     model_context_window: 258000,
     model_auto_compact_token_limit: 220000,
-    model_reasoning_effort: "high"
+    model_reasoning_effort: "low"
   });
 
   const second = new WorkerCoordinator({ cwd, dataRoot, clientFactory });

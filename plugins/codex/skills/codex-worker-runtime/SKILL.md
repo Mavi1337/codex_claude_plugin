@@ -41,8 +41,9 @@ match the worker's `worker start` assignment exactly.
 
 Review targets are `--base REF`, `--range A..B`, `--last N`, `--worktree`,
 `--staged`, `--unstaged`, repeated `--path`/`--file`, or repeated
-`--audit-path`. Add `--effort xhigh` for final review; task review defaults to
-high. Reports are returned as canonical file paths.
+`--audit-path`. Sol runs `gpt-6-astra` at effort `low` unless `--effort`
+names a higher one; that applies to task review, branch review, and synthesis
+alike. Reports are returned as canonical file paths.
 
 ## Interaction contract
 

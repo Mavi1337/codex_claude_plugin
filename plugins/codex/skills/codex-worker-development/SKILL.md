@@ -23,8 +23,8 @@ If the user already chose Codex development, proceed without asking again.
    worktree, so test commands, interpreter paths, and commit-message rules
    only reach it that way.
 2. Show task count, maximum concurrency (at most five), Luna
-   `gpt-5.6-luna/xhigh`, Sol `gpt-5.6-sol/high`, and optional final
-   `gpt-5.6-sol/xhigh` review. Obtain one authorization to dispatch.
+   and review models (`gpt-6-astra`, effort `low` unless `--effort` raises it).
+   Obtain one authorization to dispatch.
 3. Create a safe orchestration ID and record the integration HEAD.
 4. Follow [implementation-loop.md](references/implementation-loop.md).
 
@@ -40,7 +40,7 @@ If the user already chose Codex development, proceed without asking again.
 - Integrate only a coordinator-created, exactly reviewed head whose two-part gate
   passes. Never merge to main, push, publish, or delete material without normal
   user authority.
-- A final xhigh branch review is recommended but remains on demand.
+- A final branch review at a raised `--effort` is recommended but remains on demand.
 
 Use [review-contract.md](references/review-contract.md) for targets, verdicts,
 fix rounds, and final review.

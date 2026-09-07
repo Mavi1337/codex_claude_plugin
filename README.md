@@ -269,7 +269,7 @@ Then check in with:
 ```
 
 Claude remains the controller while the plugin creates isolated task worktrees,
-runs persistent `gpt-5.6-luna` workers at `xhigh`, creates trusted Git commits,
+runs persistent `gpt-6-astra` workers, creates trusted Git commits,
 and gates each task through a fresh read-only `gpt-5.6-sol` review. The runtime
 supports up to five concurrent inference turns, explicit follow-up messages,
 blocking approval/input callbacks, stop/close, and later thread resumption.
