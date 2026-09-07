@@ -9,7 +9,9 @@ Orchestrate focused Luna implementation workers and fresh Sol reviewers while
 Claude remains controller, adjudicator, and integration owner.
 
 **REQUIRED SUB-SKILL:** Use `codex-worker-runtime` for every runtime operation.
-Compose the first Luna message with `gpt-5-4-prompting`.
+Compose the first Luna message with `gpt-6-astra-prompting`, which is also the
+guide for Sol review briefs — both roles run `gpt-6-astra`. Use
+`gpt-5-4-prompting` only for a run pinned to a 5.4-family model with `--model`.
 
 When an implementation plan is ready, offer three implementation modes:
 inline, native Claude subagent-driven development, or Codex worker development.
