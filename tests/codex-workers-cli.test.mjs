@@ -194,7 +194,7 @@ test("worker CLI fails compatibly instead of silently substituting a missing mod
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
   const result = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "luna-1", "--orchestration", "orch-1", "--json"], { cwd: repo, env });
   assert.equal(result.status, 3);
-  assert.match(result.stderr, /gpt-5\.6-luna.*unavailable/i);
+  assert.match(result.stderr, /gpt-6-astra.*unavailable/i);
 });
 
 test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t) => {
@@ -225,7 +225,7 @@ test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t
   assert.equal(state.lastThreadStart.config.model_auto_compact_token_limit, 220000);
 });
 
-test("oversized Sol review runs bounded passes and a fresh xhigh synthesis", (t) => {
+test("oversized Sol review runs bounded passes and a fresh default-effort synthesis", (t) => {
   const repo = makeTempDir("review-split-repo-");
   const dataRoot = makeTempDir("review-split-data-");
   const binDir = makeTempDir("review-split-bin-");
@@ -246,7 +246,7 @@ test("oversized Sol review runs bounded passes and a fresh xhigh synthesis", (t)
   assert.equal(reviewed.parsed.result.synthesized, true);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.ok(state.appServerStarts >= 3);
-  assert.equal(state.lastTurnStart.effort, "xhigh");
+  assert.equal(state.lastTurnStart.effort, "low");
   const synthesisInput = JSON.parse(fs.readFileSync(path.join(path.dirname(reviewed.parsed.result.reportFile), "synthesis-input.json"), "utf8"));
   assert.ok(synthesisInput.passReviews.length >= 2);
   assert.equal(synthesisInput.passReviews.every((pass) => typeof pass.passId === "string" && Array.isArray(pass.paths) && /^[a-f0-9]{64}$/.test(pass.packageHash)), true);
