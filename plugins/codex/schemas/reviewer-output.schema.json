@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Sol Review Output",
+  "title": "Reviewer Output",
   "type": "object",
   "additionalProperties": false,
   "required": [

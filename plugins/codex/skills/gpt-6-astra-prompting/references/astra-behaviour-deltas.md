@@ -15,8 +15,8 @@ materially change the result." OpenAI's own remedy is prompt-side: tell it to
 infer intent and scope, treat request phrasing as instruction, and finish the
 authorized work before asking.
 
-*In this plugin:* a Luna worker has no user to answer it. A question mid-turn is
-a held concurrency slot and a coordinator round. The `pendingRequest` field in
+*In this plugin:* an implementer running Astra sends questions to the controller.
+A question mid-turn requires a coordinator round. The `pendingRequest` field in
 `worker status` is where these surface. `initiative_and_scope` is the fix; a
 higher `--effort` is not.
 
@@ -64,7 +64,7 @@ The guide encourages parallel delegation to other agents and, because those
 messages may be read by a human, explicitly asks for legible text with proper
 spacing.
 
-*In this plugin:* Luna workers do not spawn sub-agents, so `delegation_legibility`
+*In this plugin:* implementers do not spawn sub-agents, so `delegation_legibility`
 is inert for them. It applies to Opus subagents and to any future role that can
 fan out.
 

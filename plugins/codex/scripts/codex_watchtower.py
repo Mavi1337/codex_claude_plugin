@@ -88,12 +88,13 @@ def collect(orch, cwd):
         #   supervisorStatus 'closed' == a retired worker from an older batch.
         #   Its turn has been 'completed' for days and nobody needs to read it
         #   again. Only a live supervisor can have work outstanding.
-        #   'sol-*' workers are the review machinery's own sub-workers; they
+        #   reviewer workers are the review machinery's own sub-workers; they
         #   produce no diff for a coordinator to read. Reviews are tracked
         #   below, by report, not by their internal worker.
         if w.get('supervisorStatus') != 'online':
             continue
-        if str(w.get('id') or '').startswith('sol-'):
+        # 'sol' is recognized only when reading pre-migration persisted state.
+        if w.get('role') in ('reviewer', 'sol'):
             continue
         turn = w.get('turn') or {}
         row = {
@@ -218,7 +219,7 @@ def render(r, args):
     if c.get('active'):
         print('running now  : %s' % ', '.join(c['active']))
 
-    print('\nlive workers (%d; retired and sol-* internals hidden):'
+    print('\nlive workers (%d; retired and reviewer internals hidden):'
           % len(r['workers']))
     for w in r['workers'][-8:]:
         print('  %-14s base %-8s supervisor %-8s thread %-6s turn %s%s'

@@ -13,12 +13,12 @@ test("worker store increments revisions and creates owner-only files", () => {
   const store = createWorkerStore(repo, { dataRoot });
 
   store.transaction((state) => {
-    state.workers["luna-1"] = { id: "luna-1", status: "idle" };
+    state.workers["implementer-1"] = { id: "implementer-1", status: "idle" };
   });
   const state = store.load();
 
   assert.equal(state.revision, 1);
-  assert.equal(state.workers["luna-1"].status, "idle");
+  assert.equal(state.workers["implementer-1"].status, "idle");
   if (process.platform !== "win32") {
     assert.equal(fs.statSync(store.rootDir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(store.stateFile).mode & 0o777, 0o600);

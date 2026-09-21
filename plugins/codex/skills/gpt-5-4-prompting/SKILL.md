@@ -6,7 +6,7 @@ user-invocable: false
 
 # GPT-5.4 Prompting
 
-Use this skill when `codex:codex-rescue` needs to ask Codex for help, or when `codex-worker-development` composes a Luna task brief.
+Use this skill when `codex:codex-rescue` needs to ask Codex for help, or when `codex-worker-development` composes an implementer brief for a selected 5.4-family model. Worker roles do not select a model.
 
 Prompt Codex like an operator, not a collaborator. Keep prompts compact and block-structured with XML tags. State the task, the output contract, the follow-through defaults, and the small set of extra constraints that matter.
 

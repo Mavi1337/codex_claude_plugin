@@ -262,35 +262,63 @@ Then check in with:
 /codex:result
 ```
 
-### Implement a Plan with Luna and Sol
+### Implement a Plan with Codex Workers
 
 ```bash
 /codex:develop docs/superpowers/plans/my-feature.md
 ```
 
 Claude remains the controller while the plugin creates isolated task worktrees,
-runs persistent `gpt-6-astra` workers, creates trusted Git commits,
-and gates each task through a fresh read-only `gpt-5.6-sol` review. The runtime
+runs persistent implementers, creates trusted Git commits,
+and gates each task through a fresh read-only reviewer. The normal workflow
+explicitly selects `gpt-6-astra` and effort `low` for both responsibilities. The runtime
 supports up to five concurrent inference turns, explicit follow-up messages,
 blocking approval/input callbacks, stop/close, and later thread resumption.
 
 The command previews task count, concurrency, model effort, and final-review
 choice before dispatch. It never merges to `main`, pushes, or publishes.
 
-Run a standalone flexible Sol review with one target:
+Run a standalone review with one target:
 
 ```bash
-/codex:sol-review --base main
-/codex:sol-review --worktree
-/codex:sol-review --staged
-/codex:sol-review --last 5
-/codex:sol-review --range abc123..def456 --path src/auth
-/codex:sol-review --audit-path src/payments
+/codex:worker-review --base main --model gpt-6-astra --effort high
+/codex:worker-review --worktree --model gpt-5.6-sol --effort xhigh
+/codex:worker-review --staged --model gpt-6-astra --effort low
+/codex:worker-review --last 5 --model gpt-6-astra --effort high
+/codex:worker-review --range abc123..def456 --path src/auth --model gpt-6-astra --effort high
+/codex:worker-review --audit-path src/payments --model gpt-6-astra --effort high
 ```
 
 Review reports and immutable package manifests are stored as canonical files.
-Oversized packages split into bounded passes and a fresh xhigh synthesis instead
-of being silently truncated.
+Oversized packages split into bounded passes and a fresh synthesis, all retaining
+the review's selected model and effort.
+
+`implementer` and `reviewer` are responsibilities, independent of model identity.
+The worker CLI and coordinator require both model and effort on every start:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-workers.mjs" worker start --cwd "$PWD" --worker task-1 --orchestration run-1 --role implementer --model gpt-5.6-luna --effort high
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-workers.mjs" worker start --cwd "$PWD" --worker check-1 --orchestration run-1 --role reviewer --model gpt-5.6-sol --effort xhigh
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-workers.mjs" worker start --cwd "$PWD" --worker task-2 --orchestration run-1 --role implementer --model gpt-6-astra --effort low
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-workers.mjs" review start --cwd "$PWD" --review review-1 --orchestration run-1 --worktree --model gpt-6-astra --effort high
+```
+
+The runtime checks the requested pair against all pages of `model/list`, including
+future models, and forwards the exact values on thread start/resume and turn start.
+Unavailable choices fail compatibly; there is no fallback. Missing flags are usage
+errors. `/codex:develop` accepts `--model`/`--effort` for both lanes and independent
+`--review-model`/`--review-effort` overrides. Its skill always supplies both flags.
+Astra prompting is used only for `gpt-6-astra` selections.
+
+Resume uses the saved model and effort. Persisted `luna`/`sol` roles normalize to
+`implementer`/`reviewer` on successful resume; those old names are rejected on new
+workers. `/codex:sol-review` remains a legacy alias for `/codex:worker-review` and
+does not select a model. Existing review/rescue/status/result/cancel/transfer
+commands retain their behavior.
+
+For development, load this checkout explicitly with
+`claude --plugin-dir ./plugins/codex`; source changes are not automatically installed.
+After runtime changes, restart the development coordinator before new work.
 
 ## Codex Integration
 
@@ -298,7 +326,7 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+For the existing review/rescue commands, you can change the default reasoning effort or model inside your user-level or project-level `config.toml`. Worker-development and worker-review starts instead require explicit choices that override model/effort defaults. For example to use `gpt-5.4-mini` on `high` for the existing commands in a specific project, add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
 model = "gpt-5.4-mini"
@@ -340,7 +368,8 @@ That means:
 Interactive development workers use dedicated headless app-server processes
 owned by one repository coordinator. They still use the same local Codex binary,
 authentication, and configuration; they are not containers or copies of Codex.
-Luna receives an isolated Git worktree, while Sol remains read-only.
+Implementers receive isolated Git worktrees with workspace-write and on-request
+approvals. Reviewers use read-only ephemeral threads with approval policy never.
 
 ### Will it use the same Codex config I already have?
 

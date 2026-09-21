@@ -38,7 +38,7 @@ const schemaFiles = fs.readdirSync(SCHEMA_DIR).filter((name) => name.endsWith(".
 test("every published schema exists to be linted", () => {
   assert.ok(schemaFiles.length >= 2, `expected schemas in ${SCHEMA_DIR}`);
   assert.ok(schemaFiles.includes("worker-turn-output.schema.json"));
-  assert.ok(schemaFiles.includes("sol-review-output.schema.json"));
+  assert.ok(schemaFiles.includes("reviewer-output.schema.json"));
 });
 
 for (const name of schemaFiles) {

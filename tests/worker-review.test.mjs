@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { resolveWorkerReviewTarget } from "../plugins/codex/scripts/lib/review-target.mjs";
 import { freezeReviewPackage } from "../plugins/codex/scripts/lib/review-package.mjs";
-import { evaluateReviewGate, validateSolReview } from "../plugins/codex/scripts/lib/worker-review.mjs";
+import { evaluateReviewGate, validateReviewerOutput } from "../plugins/codex/scripts/lib/worker-review.mjs";
 
 function repoWithHistory() {
   const repo = makeTempDir("review-repo-");
@@ -74,15 +74,15 @@ test("audit roots recurse and committed file filters use the reviewed Git object
   assert.doesNotMatch(committed.content, /working copy/);
 });
 
-test("Sol review schema supports location-free findings and deterministic gates", () => {
-  const review = validateSolReview({
+test("Reviewer review schema supports location-free findings and deterministic gates", () => {
+  const review = validateReviewerOutput({
     schemaVersion: 1,
     specVerdict: "cannot-verify",
     qualityVerdict: "approve",
     summary: "Requirement source unavailable.",
     findings: [{ severity: "important", title: "Missing requirement evidence", evidence: "No spec supplied", impact: "Compliance is unknown", recommendation: "Attach the spec", confidence: 0.9, locations: [] }]
   }, { reviewId: "review-1", passId: "pass-1" });
-  assert.match(review.findings[0].id, /^SOL-[A-F0-9]{12}$/);
+  assert.match(review.findings[0].id, /^REVIEW-[A-F0-9]{12}$/);
   assert.equal(evaluateReviewGate(review).status, "block");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "approve", findings: [] }).status, "pass");
   assert.equal(evaluateReviewGate({ ...review, specVerdict: "pass", qualityVerdict: "changes-required" }).status, "block");
@@ -91,7 +91,7 @@ test("Sol review schema supports location-free findings and deterministic gates"
   }).status, "block");
 });
 
-test("Sol validation rejects unknown fields and replaces model-provided finding IDs", () => {
+test("Reviewer validation rejects unknown fields and replaces model-provided finding IDs", () => {
   const base = {
     schemaVersion: 1,
     specVerdict: "pass",
@@ -99,9 +99,9 @@ test("Sol validation rejects unknown fields and replaces model-provided finding 
     summary: "ok",
     findings: [{ id: "MODEL-ID", severity: "minor", title: "Title", evidence: "Evidence", impact: "Impact", recommendation: "Fix", confidence: 0.8, locations: [] }]
   };
-  const validated = validateSolReview(base, { reviewId: "review-1", passId: "pass-1" });
-  assert.match(validated.findings[0].id, /^SOL-/);
+  const validated = validateReviewerOutput(base, { reviewId: "review-1", passId: "pass-1" });
+  assert.match(validated.findings[0].id, /^REVIEW-/);
   assert.notEqual(validated.findings[0].id, "MODEL-ID");
-  assert.throws(() => validateSolReview({ ...base, surprise: true }), /unknown top-level/i);
-  assert.throws(() => validateSolReview({ ...base, findings: [{ ...base.findings[0], locationTypo: true }] }), /unknown fields/i);
+  assert.throws(() => validateReviewerOutput({ ...base, surprise: true }), /unknown top-level/i);
+  assert.throws(() => validateReviewerOutput({ ...base, findings: [{ ...base.findings[0], locationTypo: true }] }), /unknown fields/i);
 });

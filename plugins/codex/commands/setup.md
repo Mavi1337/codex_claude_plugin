@@ -11,8 +11,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
 ```
 
 Worker development performs an additional fail-closed model/effort capability
-probe when `/codex:develop` or `/codex:sol-review` starts. If the active Codex
-account/provider does not expose `gpt-6-astra` at the requested effort, report
+probe when `/codex:develop` or `/codex:worker-review` starts. If the active Codex
+account/provider does not expose the explicitly selected model and effort, report
 that diagnostic instead of substituting a model.
 
 If the result says Codex is unavailable and npm is available:

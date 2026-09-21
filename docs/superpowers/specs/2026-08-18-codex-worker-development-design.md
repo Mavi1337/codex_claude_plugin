@@ -2,15 +2,15 @@
 
 **Date:** 2026-08-18
 
-**Status:** Revised after Sol architecture review; approved for implementation
+**Status:** Approved; model/role separation revised for 1.0.11
 
-**Revision:** 2026-08-18. This version incorporates the findings in
-`2026-08-18-codex-worker-development-sol-review.md`. Normative rules override
-older examples if they conflict.
+**Revision:** 2026-09-21. The user-approved model/role separation supersedes older
+role/model coupling. The dated `*-sol-review.md` reports are historical review
+artifacts, not current routing instructions. Normative rules override old examples.
 
 ## Goal
 
-Extend the existing Claude Code Codex plugin with a modular worker runtime that lets a capable Claude Code agent such as Fable orchestrate interactive Codex workers. GPT-5.6 Luna workers implement plan tasks in isolated Git worktrees, GPT-5.6 Sol workers independently review their work, and the Claude controller adjudicates findings and integrates approved commits.
+Extend the existing Claude Code Codex plugin with a modular worker runtime that lets a capable Claude Code agent such as Fable orchestrate interactive Codex workers. Implementers execute plan tasks in isolated Git worktrees, reviewers independently review their work, and the Claude controller adjudicates findings and integrates approved commits. Model and effort are independent explicit selections for either responsibility.
 
 The runtime must also be reusable by future Claude Code skills that need interactive Codex workers without copying the app-server, process, state, or Git implementation.
 
@@ -33,7 +33,9 @@ Superpowers may produce the specification and implementation plan, but this plug
 
 The `codex-worker-development` skill description also makes the workflow discoverable when an implementation plan is ready. It may be offered alongside inline execution and native Claude subagent-driven development, but correct operation must not depend on another skill remembering to offer it. An explicit `/codex:develop` invocation is the reliable entry point.
 
-A separate `/codex:sol-review` command exposes the reusable Sol review engine independently of plan execution.
+A separate `/codex:worker-review` command exposes the reusable review engine
+independently of plan execution. `/codex:sol-review` remains a clearly labeled
+legacy alias with the same selection behavior; its name does not select Sol.
 
 The main Claude Code model remains the controller. The plugin does not select or enforce Fable; it works with the capable controller model chosen by the user.
 
@@ -47,9 +49,9 @@ Claude controller (Fable)
 Reusable worker runtime
         |
         +-- per-repository coordinator
-              +-- codex app-server -- Luna thread A
-              +-- codex app-server -- Luna thread B
-              +-- codex app-server -- Sol thread C
+              +-- codex app-server -- Implementer thread A
+              +-- codex app-server -- Implementer thread B
+              +-- codex app-server -- Reviewer thread C
               +-- queue, integration lease, durable state and artifacts
 ```
 
@@ -61,15 +63,16 @@ Proposed module layout:
 plugins/codex/
 ├── commands/
 │   ├── develop.md
-│   └── sol-review.md
+│   ├── worker-review.md
+│   └── sol-review.md (legacy alias)
 ├── prompts/
-│   ├── luna-implementer.md
-│   ├── sol-task-reviewer.md
-│   ├── sol-re-reviewer.md
-│   └── sol-branch-reviewer.md
+│   ├── implementer.md
+│   ├── task-reviewer.md
+│   ├── re-reviewer.md
+│   └── branch-reviewer.md
 ├── schemas/
 │   ├── worker-turn-output.schema.json
-│   └── sol-review-output.schema.json
+│   └── reviewer-output.schema.json
 ├── skills/
 │   ├── codex-worker-runtime/
 │   │   └── SKILL.md
@@ -131,7 +134,31 @@ distinguish usage (2), compatibility (3), conflict/stale state (4), unavailable
 runtime (5), and internal failure (1). IDs match
 `[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}`.
 
-The interface is role-neutral. A worker record contains the requested model, effort, prompt/role contract, permissions, working directory, thread ID, branch, worktree, state, and artifact paths. Luna and Sol are role profiles layered on this generic interface.
+The interface is role-neutral. A worker record contains the requested model, effort, prompt/role contract, permissions, working directory, thread ID, branch, worktree, state, and artifact paths. `implementer` and `reviewer` select responsibilities and permissions only.
+
+Both `worker start` and `review start` require `--model MODEL --effort EFFORT`.
+The coordinator rejects either missing or blank value even if the request key
+was previously used. No model or effort is defaulted, trimmed, or substituted.
+Discovery follows `model/list` pagination and accepts any exposed identifier and
+supported effort, without a model allowlist. Thread start/resume receives the
+exact model and `config.model_reasoning_effort`; turn start receives the same
+model and effort. Unsupported pairs fail with a compatibility diagnostic.
+
+Examples (append the required worker/review and orchestration IDs):
+
+```text
+worker start --role implementer --model gpt-5.6-luna --effort high
+worker start --role reviewer --model gpt-5.6-sol --effort xhigh
+worker start --role implementer --model gpt-6-astra --effort low
+review start --model gpt-6-astra --effort high --worktree
+```
+
+New workers default only their role to `implementer`; `luna` and `sol` are invalid
+new roles. `worker resume` reads the saved record, normalizes those historical
+roles to `implementer` and `reviewer`, and persists the normalized record after a
+successful resume. Preserve the existing worker/thread/branch identities and
+exact saved model/effort. Missing or unavailable saved selections fail; never
+invent a profile from the old role name.
 
 ## Coordinator, workers, and concurrency
 
@@ -235,7 +262,7 @@ Example controller result:
 ```json
 {
   "status": "completed",
-  "workerId": "luna-2",
+  "workerId": "implementer-2",
   "threadId": "thread-id",
   "head": "abc123",
   "tests": "passed",
@@ -265,11 +292,11 @@ orchestrations/<orchestration-id>/
 │       ├── brief.md
 │       ├── implementation-report.md
 │       ├── review-package.md
-│       ├── sol-review.json
+│       ├── reviewer-report.json
 │       └── re-reviews/
 └── final/
     ├── review-package.md
-    └── sol-review.json
+    └── reviewer-report.json
 ```
 
 State records include worker ID, role, status, PID, endpoint, model, effort, thread ID, turn ID, branch, worktree, base commit, head commit, artifact paths, timestamps, and the last recoverable error.
@@ -301,12 +328,12 @@ The Claude controller owns one integration branch/worktree. Every implementation
 
 The controller derives dependencies and likely file ownership from the implementation plan. It may run tasks concurrently only when their declared dependencies are satisfied and their expected files/interfaces do not overlap. Tasks with dependencies wait until prerequisite commits have passed review and been integrated.
 
-Luna edits and tests but cannot write Git metadata. It returns a structured result
+Implementer edits and tests but cannot write Git metadata. It returns a structured result
 describing changed files, tests, and concerns. The trusted coordinator validates
 that changes stay within the assigned worktree, stages only runtime-derived
 allowed paths, rejects submodules and unexpected repositories, and creates a
 mechanical commit with hooks disabled and signing off. Authorship identifies the
-controller/runtime while the report records the Luna worker/thread. The
+controller/runtime while the report records the implementer worker/thread. The
 coordinator records the exact staged tree and resulting full commit ID.
 
 After review approval, the coordinator derives the ordered commits from the
@@ -321,19 +348,20 @@ If integration conflicts:
 1. keep the integration branch unchanged;
 2. record the conflict in the ledger;
 3. abort the cherry-pick and create a repair branch from the new integration HEAD;
-4. replay the exact task patch, resume the owning Luna thread with the repair
+4. replay the exact task patch, resume the owning Implementer thread with the repair
    worktree and conflict details, then verify it;
 5. review the entire repaired base-to-head delta before integration.
 
 ## Role policies
 
-### Luna implementer
+### Implementer
 
-Default role configuration:
+Role policy (independent of model selection):
 
 ```text
-model: gpt-5.6-luna
-reasoning effort: xhigh
+role: implementer
+model: required explicit selection
+reasoning effort: required explicit selection
 sandbox: workspace-write
 writable roots: assigned worktree only
 network: restricted unless approved
@@ -342,24 +370,25 @@ approval policy: on-request
 approvals reviewer: user
 ```
 
-Luna reads one focused task brief, implements, tests, self-reviews, and returns a
+Implementer reads one focused task brief, implements, tests, self-reviews, and returns a
 structured implementation result. The coordinator writes its report and creates
-the Git commit. Luna does not spawn reviewers. Follow-up fixes resume the same
+the Git commit. Implementer does not spawn reviewers. Follow-up fixes resume the same
 thread for rounds one through three so it retains implementation context.
 
-### Sol task reviewer
+### Reviewer
 
-Default task-review configuration:
+Role policy (independent of model selection):
 
 ```text
-model: gpt-5.6-sol
-reasoning effort: high
+role: reviewer
+model: required explicit selection
+reasoning effort: required explicit selection
 sandbox: read-only
 approval: never
 thread: fresh and ephemeral
 ```
 
-Sol reviews are generic read-only `turn/start` calls with an output schema over a
+Reviews are generic read-only `turn/start` calls with an output schema over a
 runtime-built immutable evidence package. Native `review/start` is not used for
 this engine. The reviewer receives the task brief, implementation report, review
 package, and binding global constraints. It does not receive the implementer's
@@ -394,27 +423,39 @@ important findings cannot be silently waived. `completed_with_concerns` is a
 terminal implementer result equivalent to `completed` for scheduling but its
 structured concerns remain inputs to review; it never bypasses the gate.
 
-### Sol final reviewer and synthesis
+### Final review and synthesis
 
-Final branch review and large-review synthesis use GPT-5.6 Sol at `xhigh`. Final review is flexible and on demand rather than hardwired to only one Git comparison. The development workflow recommends it before handoff, while `/codex:sol-review` permits independent invocation at any time.
+Final branch review requires an explicit model and effort, like task review.
+Every bounded pass, repair turn and synthesis keeps that exact selection; the
+runtime never raises effort automatically. Final review is flexible and on
+demand. The development workflow recommends it before handoff, while
+`/codex:worker-review` permits independent invocation at any time.
+
+The normal orchestration workflow chooses `gpt-6-astra` and explicit `low` on
+every worker/review start. User requests for Luna, Sol or Astra map to
+`gpt-5.6-luna`, `gpt-5.6-sol` or `gpt-6-astra` respectively, without changing the
+role. Honor the requested effort, or explicitly choose the workflow's recommended
+effort before dispatch. `--review-model` and `--review-effort` let `/codex:develop`
+select the review lane separately from `--model` and `--effort` for both lanes.
+Use `gpt-6-astra-prompting` only for a selected `gpt-6-astra` run.
 
 ## Development and review loop
 
 For each plan task:
 
 1. The controller extracts a focused brief and records the task base commit.
-2. A Luna worker implements and tests; the coordinator validates, reports, and commits.
+2. An implementer worker implements and tests; the coordinator validates, reports, and commits.
 3. The runtime creates a review package from the exact base-to-head range.
-4. A fresh Sol task reviewer checks both specification compliance and code quality.
+4. A fresh task reviewer checks both specification compliance and code quality.
 5. The controller reads the compact verdict, opens report findings or relevant diff sections as needed, and adjudicates conflicts between the report, plan, and specification.
-6. Critical and important findings, confirmed specification gaps, and controller-required changes go back to the same Luna thread.
-7. Luna fixes and re-tests; the coordinator creates the next commit and appends its report.
-8. A fresh Sol re-reviewer receives the open findings and the scoped fix diff. It verdicts each finding as addressed or not addressed and reports new material breakage in the fix.
+6. Critical and important findings, confirmed specification gaps, and controller-required changes go back to the same implementer thread.
+7. Implementer fixes and re-tests; the coordinator creates the next commit and appends its report.
+8. A fresh re-reviewer receives the open findings and the scoped fix diff. It verdicts each finding as addressed or not addressed and reports new material breakage in the fix.
 9. After both verdicts pass, the controller cherry-picks the task commits into the integration branch and records completion.
 
 Fix-loop policy:
 
-- Rounds 1-3 resume the original Luna thread.
+- Rounds 1-3 resume the original Implementer thread.
 - Rounds 4-5 use a fresh, more capable implementer chosen by the controller and carry the brief, report, attempts, and open findings as files.
 - After round 5, the controller adjudicates remaining findings and records explicit rulings. The workflow cannot loop indefinitely.
 
@@ -452,14 +493,14 @@ A file list without a change baseline is a current-state audit. A file list comb
 Example interface:
 
 ```text
-/codex:sol-review --base main
-/codex:sol-review --worktree
-/codex:sol-review --staged
-/codex:sol-review --last 5
-/codex:sol-review --range abc123..def456
-/codex:sol-review --base main --path src/auth
-/codex:sol-review --files src/api.ts,src/auth.ts
-/codex:sol-review --audit-path src/payments
+/codex:worker-review --base main --model gpt-6-astra --effort high
+/codex:worker-review --worktree --model gpt-5.6-sol --effort xhigh
+/codex:worker-review --staged --model gpt-6-astra --effort low
+/codex:worker-review --last 5 --model gpt-6-astra --effort high
+/codex:worker-review --range abc123..def456 --model gpt-6-astra --effort high
+/codex:worker-review --base main --path src/auth --model gpt-6-astra --effort high
+/codex:worker-review --file src/api.ts --file src/auth.ts --model gpt-6-astra --effort high
+/codex:worker-review --audit-path src/payments --model gpt-6-astra --effort high
 ```
 
 Every target is frozen before review. Committed targets resolve to full object
@@ -489,20 +530,19 @@ and submodules/LFS pointers are recorded but not recursively expanded.
 Review context limits are runtime policy, not prompt prose. Defaults:
 
 ```text
-Sol effective context budget: 258,000 tokens
-Sol review-package/input budget: 190,000 tokens
-Sol automatic compaction threshold: 220,000 tokens
+Reviewer effective context budget: 258,000 tokens
+review-package/input budget: 190,000 tokens
+Reviewer automatic compaction threshold: 220,000 tokens
 ```
 
 The configured 258K ceiling is a conservative policy cap, not a claim that
-`model/list` advertises a context window. It remains in effect when a model
-supports a larger window unless the user raises it. If a provider's verified
-limit is known, the effective cap is the lower value; if unknown, the runtime
-fails closed when requested limits exceed its configured compatibility table.
-Luna has a separate configurable cap and otherwise uses the selected model's
-Codex default.
+`model/list` advertises a context window. It is applied equally to the selected
+review model, without a model-specific compatibility table. App-server responses
+do not confirm context limits; reports record requested settings and this
+limitation. Providers with smaller limits may reject a review, which must surface
+as a failure. Implementers use the selected model's Codex context defaults.
 
-For the default Sol cap, 190K is the maximum evidence package, 22K is reserved
+For the default Reviewer cap, 190K is the maximum evidence package, 22K is reserved
 for fixed instructions and schema, 24K for tool/evidence expansion, 14K for
 output, and 8K for tokenizer/measurement error. The total is 258K. Automatic
 compaction starts at 220K. Reports record estimated tokens, tokenizer/version or
@@ -512,19 +552,21 @@ settings, and settings confirmed by available telemetry.
 Before a review starts, the package builder estimates token size conservatively.
 If the package exceeds 190K it must not truncate silently or rely solely on
 compaction. It divides the target into manifest-owned passes, adds a declared
-cross-cutting pass where needed, and runs a fresh Sol synthesis thread over only
+cross-cutting pass where needed, and runs a fresh reviewer synthesis thread over only
 bounded reports. Each pass and synthesis independently obeys the full accounting
 above.
 
-Per-task review uses `high`; final review and large-review synthesis use `xhigh`. Users may override model, effort, and budgets through plugin configuration or explicit command options.
+Model and effort always come from explicit start options. Synthesis retains the
+review's pair. Users may lower review input bounds with `--max-input-tokens`.
 
 ## Permissions and approvals
 
-Luna may freely perform reversible actions inside its assigned worktree that fit its sandbox and task. Network access, dependency installation requiring network, access outside allowed writable roots, or other escalated operations produce `needs_approval` for the Claude controller.
+Implementer may freely perform reversible actions inside its assigned worktree that fit its sandbox and task. Network access, dependency installation requiring network, access outside allowed writable roots, or other escalated operations produce `needs_approval` for the Claude controller.
 
 The app-server client must support and route relevant server-initiated approval requests instead of returning the current generic unsupported-method error. The coordinator records the exact action, reason, scope, and risk. The controller may approve routine reversible actions already authorized by the user's task. It must involve the user for destructive operations, security-sensitive actions, pushes, publishes, changes to shared external state, or meaningful scope expansion.
 
-Sol reviewers remain read-only and never request mutation approval.
+Reviewers remain read-only. The coordinator rejects command, file-change and
+permission approval requests from them without exposing an approvable callback.
 
 ## Failure recovery
 
@@ -547,10 +589,10 @@ Sol reviewers remain read-only and never request mutation approval.
 
 ## Configuration
 
-Worker-development settings extend the plugin's existing repository-keyed configuration. Defaults are explicit and versioned. Configuration includes:
+Worker-development settings extend the plugin's existing repository-keyed configuration. Model and effort have no runtime defaults. Configuration includes:
 
 - maximum concurrent Codex turns;
-- implementer and reviewer model/effort;
+- explicit implementer and reviewer model/effort selections at the start boundary;
 - role-specific context, input, and compaction budgets;
 - worktree root;
 - coordinator/app-server startup, idle, and graceful-shutdown timeouts;
@@ -561,7 +603,7 @@ Worker-development settings extend the plugin's existing repository-keyed config
 Commands may override safe per-run values. Managed or machine-level Codex restrictions remain authoritative and cannot be weakened by plugin configuration.
 
 Before dispatch, `/codex:develop` displays the resolved task count, concurrency
-cap, Luna/Sol models and efforts, and whether final xhigh review is enabled.
+cap, implementer/reviewer models and efforts, and whether final review is enabled.
 Status includes queued/running/completed turn counts and review counts so the
 controller and user can see the usage shape without approving every turn.
 
@@ -573,8 +615,8 @@ The new worker CLI and modules are additive. Existing command output, state reco
 record names the minimum tested Codex CLI version and verifies initialize,
 `model/list`, `thread/start`, `thread/resume`, `turn/start` with output schema,
 `turn/interrupt`, required server-request methods, configuration overrides, and
-the requested model/effort combination. Luna requires `gpt-5.6-luna` with
-`xhigh`; Sol requires `gpt-5.6-sol` with `high` and `xhigh`. Missing models,
+the requested model/effort combination. Either role accepts any model exposed by
+discovery at one of its supported efforts. Missing models,
 efforts, methods, or required configuration fail with actionable diagnostics;
 there is no silent model fallback. Experimental features are used only after an
 explicit advertised probe. CI maintains a minimum-protocol fixture and a current
@@ -583,10 +625,10 @@ fixture.
 Rollout stages:
 
 1. Add generic worker state, coordinator, and explicit-thread operations behind internal commands.
-2. Add interactive Luna role and worktree lifecycle.
-3. Add Sol structured review and flexible target packaging.
+2. Add interactive Implementer role and worktree lifecycle.
+3. Add Reviewer structured review and flexible target packaging.
 4. Add the `codex-worker-development` orchestration skill and `/codex:develop` command.
-5. Add `/codex:sol-review` and documented local-development testing.
+5. Add `/codex:worker-review`, its legacy alias, and documented local-development testing.
 
 No stage depends on editing Claude's plugin cache. Development uses the source checkout through Claude Code's local plugin-development loading flow.
 
@@ -623,7 +665,7 @@ Runtime integration coverage includes:
 Git integration coverage includes:
 
 - isolated task branches/worktrees;
-- actual workspace-write behavior in a linked worktree, proving Luna cannot and
+- actual workspace-write behavior in a linked worktree, proving Implementer cannot and
   need not commit;
 - coordinator staging with hooks disabled and exact tree/commit recording;
 - preservation of committed branches on close;
@@ -634,9 +676,9 @@ Git integration coverage includes:
 
 Review coverage includes every supported change/audit target, stable finding IDs, both required verdicts, canonical report creation, compact controller results, scoped re-review, context-budget partitioning, and synthesis.
 
-An end-to-end fake-runtime scenario executes two independent Luna tasks, receives two Sol reviews, routes one finding through a Luna fix and scoped re-review, and verifies that the integration branch contains only approved commits.
+An end-to-end fake-runtime scenario executes two independent Implementer tasks, receives two Reviews, routes one finding through an implementer fix and scoped re-review, and verifies that the integration branch contains only approved commits.
 
-A manual opt-in smoke test may use real Luna and Sol to validate model availability and current app-server behavior before release. It is never part of normal CI.
+A manual opt-in smoke test may use explicitly selected real models for both roles to validate availability and current app-server behavior. It is never part of normal CI.
 
 Linux runs the real linked-worktree and Unix-socket tests. macOS and Windows CI
 exercise their sandbox/IPC/process variants; Windows tests the user-scoped named
@@ -645,12 +687,12 @@ pipe and path handling explicitly.
 ## Success criteria
 
 - Fable can orchestrate up to five concurrent Codex turns without mixing worker state or notifications.
-- It can message, wait for, interrupt, close, and later resume an explicitly identified Luna worker.
-- Luna can return questions and approval requests at tool boundaries and continue in the same thread after a response.
-- Every task runs in an isolated worktree and integrates only after controller-approved Sol review.
-- Sol reports separate specification-compliance and code-quality verdicts with grounded file/line findings.
+- It can message, wait for, interrupt, close, and later resume an explicitly identified Implementer worker.
+- Implementer can return questions and approval requests at tool boundaries and continue in the same thread after a response.
+- Every task runs in an isolated worktree and integrates only after controller-approved review.
+- Reviewer reports separate specification-compliance and code-quality verdicts with grounded file/line findings.
 - Review supports branch, worktree, staged, unstaged, last-N, explicit range, path-filtered, file-list, and current-state audit targets.
-- Sol review threads remain within their configured 258K effective context budget, splitting oversized reviews without silent truncation.
+- review threads remain within their configured 258K effective context budget, splitting oversized reviews without silent truncation.
 - Canonical reports and orchestration state survive controller compaction and session restart.
 - Existing Codex plugin commands remain behaviorally compatible.
 - The runtime is reusable by future skills without duplicating app-server or worker-management code.

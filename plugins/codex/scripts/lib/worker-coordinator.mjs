@@ -15,13 +15,13 @@ import {
 } from "./worker-worktree.mjs";
 import { resolveWorkerReviewTarget } from "./review-target.mjs";
 import { freezeReviewPackage } from "./review-package.mjs";
-import { evaluateReviewGate, validateSolReview, validateWorkerResult } from "./worker-review.mjs";
+import { evaluateReviewGate, validateReviewerOutput, validateWorkerResult } from "./worker-review.mjs";
 
-const SOL_SCHEMA_URL = new URL("../../schemas/sol-review-output.schema.json", import.meta.url);
-const SOL_TASK_PROMPT_URL = new URL("../../prompts/sol-task-reviewer.md", import.meta.url);
-const SOL_BRANCH_PROMPT_URL = new URL("../../prompts/sol-branch-reviewer.md", import.meta.url);
+const REVIEWER_SCHEMA_URL = new URL("../../schemas/reviewer-output.schema.json", import.meta.url);
+const TASK_REVIEWER_PROMPT_URL = new URL("../../prompts/task-reviewer.md", import.meta.url);
+const BRANCH_REVIEWER_PROMPT_URL = new URL("../../prompts/branch-reviewer.md", import.meta.url);
 const WORKER_SCHEMA_URL = new URL("../../schemas/worker-turn-output.schema.json", import.meta.url);
-const LUNA_PROMPT_URL = new URL("../../prompts/luna-implementer.md", import.meta.url);
+const IMPLEMENTER_PROMPT_URL = new URL("../../prompts/implementer.md", import.meta.url);
 
 const INPUT_METHODS = new Set(["item/tool/requestUserInput", "mcpServer/elicitation/request"]);
 const ACTIVE_TURN_STATUSES = new Set(["queued", "running", "waiting-input", "waiting-approval"]);
@@ -34,7 +34,15 @@ const APPROVAL_METHODS = new Set([
 function nowIso() { return new Date().toISOString(); }
 function turnInput(prompt) { return [{ type: "text", text: prompt, text_elements: [] }]; }
 function sha256(value) { return createHash("sha256").update(value).digest("hex"); }
-function reviewWorkerId(reviewId, suffix) { return `sol-${sha256(reviewId).slice(0, 16)}-${suffix}`; }
+function reviewWorkerId(reviewId, suffix) { return `reviewer-${sha256(reviewId).slice(0, 16)}-${suffix}`; }
+function roleKind(role) {
+  if (role === "implementer" || role === "reviewer") return role;
+  throw new Error(`Unknown worker role ${role}. Use implementer or reviewer.`);
+}
+function requiredProfileValue(value, label) {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is required.`);
+  return value;
+}
 function boundedOutput(value) {
   const source = String(value);
   return source.length > 131072 ? `${source.slice(0, 131072)}\n[truncated; canonical full output belongs in an artifact]` : source;
@@ -232,6 +240,14 @@ export class WorkerCoordinator {
 
   async dispatch(operation, params, idempotencyKey) {
     assertSafeId(idempotencyKey, "idempotencyKey");
+    if (operation === "worker.start" || operation === "review.start") {
+      requiredProfileValue(params.model, "Worker/review model");
+      requiredProfileValue(params.effort, "Worker/review effort");
+    }
+    if (operation === "worker.start") {
+      roleKind(params.role ?? "implementer");
+      if (params.threadId) throw new Error("Use worker.resume to resume persisted workers.");
+    }
     if (params.cwd && fs.realpathSync(params.cwd) !== this.cwd) {
       throw new Error(`Coordinator is bound to integration worktree ${this.cwd}; refusing ${params.cwd}.`);
     }
@@ -239,7 +255,7 @@ export class WorkerCoordinator {
     if (prior) return prior;
     if (operation === "review.start") {
       const reviewId = assertSafeId(params.reviewId, "reviewId");
-      const running = { id: reviewId, status: "running", startedAt: nowIso() };
+      const running = { id: reviewId, status: "running", model: params.model, effort: params.effort, startedAt: nowIso() };
       this.store.transaction((state) => {
         if (state.reviews[reviewId] && !["failed", "indeterminate", "stale"].includes(state.reviews[reviewId].status)) throw new Error(`Review ${reviewId} already exists.`);
         state.reviews[reviewId] = running;
@@ -249,7 +265,7 @@ export class WorkerCoordinator {
         this.store.transaction((state) => { state.idempotency[idempotencyKey] = completed; });
       }).catch((error) => {
         this.store.transaction((state) => {
-          state.reviews[reviewId] = { ...running, status: "failed", error: String(error.message ?? error), completedAt: nowIso() };
+          state.reviews[reviewId] = { ...running, status: "failed", error: String(error.message ?? error), errorCode: error.code ?? null, completedAt: nowIso() };
           state.idempotency[idempotencyKey] = state.reviews[reviewId];
         });
       });
@@ -257,7 +273,7 @@ export class WorkerCoordinator {
     }
     let result;
     switch (operation) {
-      case "worker.start": result = await this.startWorker(params); break;
+      case "worker.start": result = await this.startWorker({ ...params, isolated: true, workerCwd: undefined }); break;
       case "worker.send": return this.send(params.workerId, params.prompt, idempotencyKey);
       case "worker.wait": result = await this.wait(params.workerId, params.timeoutMs ?? 0); break;
       case "worker.status": result = this.status(params.workerId); break;
@@ -268,6 +284,8 @@ export class WorkerCoordinator {
         const record = this.status(params.workerId);
         result = await this.startWorker({
           ...record,
+          // Only persisted state may carry the pre-1.0.11 responsibility names.
+          role: record.role === "luna" ? "implementer" : record.role === "sol" ? "reviewer" : record.role,
           workerId: record.id,
           threadId: record.thread.id,
           cwd: record.integrationCwd ?? record.cwd,
@@ -279,9 +297,9 @@ export class WorkerCoordinator {
       case "worker.resolve-request": return this.resolveRequest(params.requestId, params.result, idempotencyKey);
       case "integration.commit": {
         const worker = this.status(params.workerId);
-        if (worker.role !== "luna") throw new Error("Only Luna implementation workers have task worktrees to commit.");
+        if (roleKind(worker.role) !== "implementer") throw new Error("Only implementation workers have task worktrees to commit.");
         if (worker.turn?.status !== "completed" || !["completed", "completed_with_concerns"].includes(worker.result?.status)) {
-          throw new Error("integration.commit requires a terminal Luna turn with a validated implementation report.");
+          throw new Error("integration.commit requires a terminal implementer turn with a validated implementation report.");
         }
         if (!Array.isArray(params.allowedPaths) || params.allowedPaths.length === 0) {
           throw new Error("integration.commit requires explicit allowed paths from the task assignment.");
@@ -306,7 +324,7 @@ export class WorkerCoordinator {
       }
       case "integration.rule": {
         const worker = this.status(params.workerId);
-        if (worker.role !== "luna") throw new Error("Only Luna implementation workers carry integrable commits.");
+        if (roleKind(worker.role) !== "implementer") throw new Error("Only implementation workers carry integrable commits.");
         if (!worker.headCommit || !worker.tree) throw new Error("A controller ruling requires a committed task worktree.");
         const reason = String(params.reason ?? "").trim();
         if (!reason) throw new Error("Controller ruling requires a reason.");
@@ -336,17 +354,17 @@ export class WorkerCoordinator {
         const worker = this.status(params.workerId);
         const binding = worker.reviewBinding;
         if (!["pass", "pass-with-ruling"].includes(worker.reviewGate) || worker.reviewGate !== binding?.gate) {
-          throw new Error("Worker changes have not passed an exact Sol review or controller ruling binding.");
+          throw new Error("Worker changes have not passed an exact review or controller ruling binding.");
         }
         if (binding.baseCommit !== worker.baseCommit || binding.headCommit !== worker.headCommit || binding.tree !== worker.tree) {
           throw new Error("Worker Git facts no longer match the passing integration binding.");
         }
         if (binding.kind !== "controller-ruling") {
           if (binding.reviewTarget?.mode !== "committed" || binding.reviewTarget.base !== binding.baseCommit || binding.reviewTarget.head !== binding.headCommit) {
-            throw new Error("The Sol review target does not match the bound worker commit range.");
+            throw new Error("The review target does not match the bound worker commit range.");
           }
           if (!binding.packageFile || !fs.existsSync(binding.packageFile) || sha256(fs.readFileSync(binding.packageFile)) !== binding.packageHash) {
-            throw new Error("The immutable Sol review package no longer matches its recorded hash.");
+            throw new Error("The immutable review package no longer matches its recorded hash.");
           }
         }
         result = this.#withIntegrationLease("apply", worker.id, () => applyReviewedCommits({
@@ -443,20 +461,34 @@ export class WorkerCoordinator {
     const orchestrationId = assertSafeId(options.orchestrationId, "orchestrationId");
     const existing = this.store.load().workers[workerId];
     if (existing && !["closed", "crashed"].includes(existing.supervisorStatus)) throw new Error(`Worker ${workerId} already exists.`);
-    const role = options.role ?? "luna";
+    const requestedRole = options.role ?? "implementer";
+    if (["luna", "sol"].includes(requestedRole)) {
+      throw new Error(`Legacy role ${requestedRole} is only accepted when resuming persisted workers; use implementer or reviewer.`);
+    }
+    const role = roleKind(requestedRole);
+    const model = requiredProfileValue(options.model, "Worker model");
+    const effort = requiredProfileValue(options.effort, "Worker effort");
     const requirementFiles = existing?.requirementFiles
-      ?? (role === "luna" ? snapshotRequirementFiles(this.store, orchestrationId, workerId, options.cwd, options.requirementPaths ?? []) : []);
-    const profile = role === "sol"
+      ?? (role === "implementer" ? snapshotRequirementFiles(this.store, orchestrationId, workerId, options.cwd, options.requirementPaths ?? []) : []);
+    const profile = role === "reviewer"
       ? {
-          model: "gpt-6-astra", effort: options.effort ?? "low", sandbox: "read-only",
+          model, effort, sandbox: "read-only",
           approvalPolicy: "never", ephemeral: true,
           config: { model_context_window: 258000, model_auto_compact_token_limit: 220000 }
         }
-      : { model: "gpt-6-astra", effort: options.effort ?? "low", sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false, config: null };
+      : { model, effort, sandbox: "workspace-write", approvalPolicy: "on-request", ephemeral: false, config: null };
     const client = await this.clientFactory(options.cwd, { role, profile });
     try {
-      const models = await client.request("model/list", { includeHidden: true });
-      const selected = models.data?.find((candidate) => candidate.model === profile.model || candidate.id === profile.model);
+      let selected;
+      let cursor;
+      const seenCursors = new Set();
+      do {
+        const models = await client.request("model/list", { includeHidden: true, ...(cursor ? { cursor } : {}) });
+        selected = models.data?.find((candidate) => candidate.model === profile.model || candidate.id === profile.model);
+        cursor = models.nextCursor;
+        if (cursor && seenCursors.has(cursor)) throw new Error("Codex model/list repeated a pagination cursor.");
+        if (cursor) seenCursors.add(cursor);
+      } while (!selected && cursor);
       if (!selected) throw Object.assign(new Error(`Required worker model ${profile.model} is unavailable; update Codex or select an account/provider that offers it.`), { code: "COMPATIBILITY" });
       const efforts = new Set((selected.supportedReasoningEfforts ?? []).map((entry) => entry.reasoningEffort));
       if (!efforts.has(profile.effort)) throw Object.assign(new Error(`Model ${profile.model} does not support required effort ${profile.effort}.`), { code: "COMPATIBILITY" });
@@ -468,7 +500,7 @@ export class WorkerCoordinator {
     let workerCwd = options.workerCwd ?? options.cwd;
     let worktree = null;
     let absentInputs = existing?.absentInputs ?? { count: 0, paths: [], truncated: false };
-    if (role === "luna" && options.isolated !== false) {
+    if (role === "implementer" && options.isolated !== false) {
       absentInputs = absentWorktreeInputs(options.cwd);
       worktree = createTaskWorktree({
         repoRoot: options.cwd,
@@ -477,16 +509,22 @@ export class WorkerCoordinator {
         worktreeRoot: options.worktreeRoot ?? this.store.artifactPath(orchestrationId, "worktrees")
       });
       workerCwd = worktree.worktree;
-    } else if (role === "luna" && options.threadId && !fs.existsSync(workerCwd) && existing?.branch) {
+    } else if (role === "implementer" && options.threadId && !fs.existsSync(workerCwd) && existing?.branch) {
       worktree = restoreTaskWorktree({ repoRoot: options.cwd, branch: existing.branch, worktree: workerCwd });
     }
     client.setNotificationHandler((message) => this.#handleNotification(workerId, message));
     client.setServerRequestHandler((message) => this.#handleServerRequest(workerId, message));
     let response;
+    const expectedSandboxType = profile.sandbox === "read-only" ? "readOnly" : "workspaceWrite";
     try {
       response = options.threadId
         ? await client.request("thread/resume", { threadId: options.threadId, cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, config: { ...(profile.config ?? {}), model_reasoning_effort: profile.effort } })
         : await client.request("thread/start", { cwd: workerCwd, model: profile.model, approvalPolicy: profile.approvalPolicy, sandbox: profile.sandbox, serviceName: "claude_code_codex_worker", ephemeral: profile.ephemeral, config: { ...(profile.config ?? {}), model_reasoning_effort: profile.effort } });
+      if (response.model !== undefined && response.model !== profile.model) throw Object.assign(new Error(`Codex selected ${response.model} instead of required ${profile.model}.`), { code: "COMPATIBILITY" });
+      if (response.reasoningEffort !== undefined && response.reasoningEffort !== null && response.reasoningEffort !== profile.effort) throw Object.assign(new Error(`Codex selected effort ${response.reasoningEffort} instead of ${profile.effort}.`), { code: "COMPATIBILITY" });
+      if (response.approvalPolicy !== undefined && !sameJson(response.approvalPolicy, profile.approvalPolicy)) throw Object.assign(new Error("Codex did not apply the required approval policy."), { code: "COMPATIBILITY" });
+      if (response.sandbox?.type && response.sandbox.type !== expectedSandboxType) throw Object.assign(new Error(`Codex applied sandbox ${response.sandbox.type} instead of ${expectedSandboxType}.`), { code: "COMPATIBILITY" });
+      if (response.cwd && fs.realpathSync(response.cwd) !== fs.realpathSync(workerCwd)) throw Object.assign(new Error("Codex thread cwd does not match the assigned worker directory."), { code: "COMPATIBILITY" });
     } catch (error) {
       await client.close().catch(() => {});
       if (worktree && !options.threadId) {
@@ -494,13 +532,8 @@ export class WorkerCoordinator {
       }
       throw error;
     }
-    const expectedSandboxType = profile.sandbox === "read-only" ? "readOnly" : "workspaceWrite";
-    if (response.model !== undefined && response.model !== profile.model) throw Object.assign(new Error(`Codex selected ${response.model} instead of required ${profile.model}.`), { code: "COMPATIBILITY" });
-    if (response.reasoningEffort !== undefined && response.reasoningEffort !== null && response.reasoningEffort !== profile.effort) throw Object.assign(new Error(`Codex selected effort ${response.reasoningEffort} instead of ${profile.effort}.`), { code: "COMPATIBILITY" });
-    if (response.approvalPolicy !== undefined && !sameJson(response.approvalPolicy, profile.approvalPolicy)) throw Object.assign(new Error("Codex did not apply the required approval policy."), { code: "COMPATIBILITY" });
-    if (response.sandbox?.type && response.sandbox.type !== expectedSandboxType) throw Object.assign(new Error(`Codex applied sandbox ${response.sandbox.type} instead of ${expectedSandboxType}.`), { code: "COMPATIBILITY" });
-    if (response.cwd && fs.realpathSync(response.cwd) !== fs.realpathSync(workerCwd)) throw Object.assign(new Error("Codex thread cwd does not match the assigned worker directory."), { code: "COMPATIBILITY" });
     const record = {
+      ...(options.threadId ? existing : {}),
       id: workerId, orchestrationId, role, cwd: workerCwd, integrationCwd: options.cwd,
       branch: worktree?.branch ?? existing?.branch ?? null,
       commonDir: worktree?.commonDir ?? existing?.commonDir ?? null,
@@ -543,17 +576,17 @@ export class WorkerCoordinator {
     if (worker.turn && !["completed", "failed", "interrupted", "indeterminate"].includes(worker.turn.status)) {
       throw new Error(`Worker ${workerId} already has an active turn.`);
     }
-    const lunaSchema = worker.role === "luna" && turnOptions.outputSchema === undefined
+    const implementerSchema = roleKind(worker.role) === "implementer" && turnOptions.outputSchema === undefined
       ? JSON.parse(fs.readFileSync(WORKER_SCHEMA_URL, "utf8"))
       : null;
-    const rolePrompt = worker.role === "luna" && turnOptions.outputSchema === undefined
-      ? `${fs.readFileSync(LUNA_PROMPT_URL, "utf8")}\n\nTask instruction:\n${String(prompt)}`
+    const rolePrompt = roleKind(worker.role) === "implementer" && turnOptions.outputSchema === undefined
+      ? `${fs.readFileSync(IMPLEMENTER_PROMPT_URL, "utf8")}\n\nTask instruction:\n${String(prompt)}`
       : String(prompt);
     const entry = {
       id: `queue-${randomUUID()}`, workerId, prompt: rolePrompt, idempotencyKey,
-      outputSchema: turnOptions.outputSchema ?? lunaSchema, queuedAt: nowIso()
+      outputSchema: turnOptions.outputSchema ?? implementerSchema, queuedAt: nowIso()
     };
-    if (worker.role === "luna") {
+    if (roleKind(worker.role) === "implementer") {
       const source = `${String(prompt).trim()}\n`;
       const instructionFile = this.store.writeArtifact(worker.orchestrationId, `tasks/${worker.id}/instructions/${entry.id}.md`, source);
       this.store.transaction((next) => {
@@ -579,6 +612,8 @@ export class WorkerCoordinator {
   async startReview(params, idempotencyKey) {
     const reviewId = assertSafeId(params.reviewId, "reviewId");
     const orchestrationId = assertSafeId(params.orchestrationId, "orchestrationId");
+    const model = requiredProfileValue(params.model, "Review model");
+    const effort = requiredProfileValue(params.effort, "Review effort");
     const reviewedWorker = params.workerId ? this.status(params.workerId) : null;
     if (reviewedWorker && (!reviewedWorker.baseCommit || !reviewedWorker.headCommit)) {
       throw new Error(`Worker ${params.workerId} has no coordinator-created commit to review.`);
@@ -594,12 +629,12 @@ export class WorkerCoordinator {
     }
     let evidenceSections = [];
     if (params.taskReview) {
-      if (!reviewedWorker) throw new Error("Task review requires an explicit Luna worker.");
+      if (!reviewedWorker) throw new Error("Task review requires an explicit implementation worker.");
       if (!reviewedWorker.taskBriefFile || !fs.existsSync(reviewedWorker.taskBriefFile)) throw new Error("Task review is missing its canonical task brief.");
-      if (!reviewedWorker.reportFile || !fs.existsSync(reviewedWorker.reportFile) || !reviewedWorker.result) throw new Error("Task review is missing the validated Luna implementation report and test evidence.");
+      if (!reviewedWorker.reportFile || !fs.existsSync(reviewedWorker.reportFile) || !reviewedWorker.result) throw new Error("Task review is missing the validated implementation report and test evidence.");
       if (!Array.isArray(reviewedWorker.assignmentPaths) || reviewedWorker.assignmentPaths.length === 0) throw new Error("Task review is missing the runtime-owned path assignment.");
       if (!Array.isArray(reviewedWorker.requirementFiles) || reviewedWorker.requirementFiles.length === 0) throw new Error("Task review requires at least one immutable requirement or specification file.");
-      const lunaConstraints = fs.readFileSync(LUNA_PROMPT_URL, "utf8");
+      const implementerConstraints = fs.readFileSync(IMPLEMENTER_PROMPT_URL, "utf8");
       evidenceSections = [
         {
           title: "Binding task brief and follow-up instructions",
@@ -609,7 +644,7 @@ export class WorkerCoordinator {
           title: "Binding requirement and specification sources",
           body: reviewedWorker.requirementFiles.map((entry) => `### ${entry.sourcePath} (${entry.hash})\n\n${fs.readFileSync(entry.file, "utf8")}`).join("\n")
         },
-        { title: "Validated Luna implementation report, tests, and concerns", body: fs.readFileSync(reviewedWorker.reportFile, "utf8") },
+        { title: "Validated implementation report, tests, and concerns", body: fs.readFileSync(reviewedWorker.reportFile, "utf8") },
         {
           title: "Binding runtime constraints",
           body: JSON.stringify({
@@ -618,8 +653,8 @@ export class WorkerCoordinator {
             baseCommit: reviewedWorker.baseCommit, headCommit: reviewedWorker.headCommit,
             tree: reviewedWorker.tree, allowedPaths: reviewedWorker.assignmentPaths,
             taskBriefHash: reviewedWorker.taskBriefHash,
-            implementerConstraintHash: sha256(lunaConstraints),
-            implementerConstraints: lunaConstraints
+            implementerConstraintHash: sha256(implementerConstraints),
+            implementerConstraints: implementerConstraints
           }, null, 2)
         }
       ];
@@ -628,12 +663,12 @@ export class WorkerCoordinator {
       maxInputTokens,
       extraSections: evidenceSections
     });
-    const schema = JSON.parse(fs.readFileSync(SOL_SCHEMA_URL, "utf8"));
-    const promptTemplate = fs.readFileSync(params.taskReview ? SOL_TASK_PROMPT_URL : SOL_BRANCH_PROMPT_URL, "utf8");
+    const schema = JSON.parse(fs.readFileSync(REVIEWER_SCHEMA_URL, "utf8"));
+    const promptTemplate = fs.readFileSync(params.taskReview ? TASK_REVIEWER_PROMPT_URL : BRANCH_REVIEWER_PROMPT_URL, "utf8");
     const packageFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/package.md`, reviewPackage.content);
     const packages = reviewPackage.requiresPartitioning
       ? reviewPackage.partitions.map((partition, index) => {
-          if (partition.estimatedTokens > maxInputTokens) throw new Error("A Sol review pass exceeds the configured input bound.");
+          if (partition.estimatedTokens > maxInputTokens) throw new Error("A review pass exceeds the configured input bound.");
           const file = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/passes/${partition.id}.md`, partition.content);
           return { ...partition, file, passId: partition.id };
         })
@@ -645,7 +680,8 @@ export class WorkerCoordinator {
         workerId: reviewWorkerId(reviewId, `p${index + 1}`),
         orchestrationId,
         cwd: path.dirname(item.file),
-        effort: params.effort ?? "low",
+        model,
+        effort,
         prompt: `${promptTemplate}\n\nUse only the immutable evidence in this package; do not inspect any live repository or external path.\nReview package: ${item.file}\nPackage SHA-256: ${item.hash}`,
         schema,
         idempotencyKey: `${idempotencyKey}-pass-${index + 1}`,
@@ -661,9 +697,9 @@ export class WorkerCoordinator {
     if (passReviews.length > 1) {
       const synthesisFile = this.store.writeArtifact(orchestrationId, `reviews/${reviewId}/synthesis-input.json`, `${JSON.stringify({ coverageMap: reviewPackage.coverageMap, passReviews }, null, 2)}\n`);
       const synthesisTokens = Math.ceil(fs.statSync(synthesisFile).size / 4) + 1024;
-      if (synthesisTokens > maxInputTokens) throw new Error("Sol synthesis evidence exceeds the configured input bound; narrow the review target.");
+      if (synthesisTokens > maxInputTokens) throw new Error("review synthesis evidence exceeds the configured input bound; narrow the review target.");
       const executed = await this.#executeReviewPass({
-        workerId: reviewWorkerId(reviewId, "synth"), orchestrationId, cwd: path.dirname(synthesisFile), effort: params.effort ?? "low",
+        workerId: reviewWorkerId(reviewId, "synth"), orchestrationId, cwd: path.dirname(synthesisFile), model, effort,
         prompt: `${promptTemplate}\n\nUse only ${synthesisFile}. Synthesize every bounded pass, preserve material findings, and fail cannot-verify if any coverage-map entry lacks a corresponding pass report.`,
         schema, idempotencyKey: `${idempotencyKey}-synthesis`, timeoutMs: params.timeoutMs,
         reviewId, passId: "synthesis"
@@ -692,6 +728,7 @@ export class WorkerCoordinator {
       findings: review.findings, summary: review.summary, gate, packageFile,
       packageHash: reviewPackage.hash, reportFile,
       contextBudget,
+      model: finalWorker?.model ?? this.status(reviewWorkerId(reviewId, "p1")).model,
       effort: finalWorker?.effort ?? this.status(reviewWorkerId(reviewId, "p1")).effort,
       passCount: passReviews.length, synthesized: passReviews.length > 1,
       completedAt: nowIso()
@@ -735,21 +772,22 @@ export class WorkerCoordinator {
       workerId: options.workerId,
       orchestrationId: options.orchestrationId,
       cwd: options.cwd,
-      role: "sol",
+      role: "reviewer",
+      model: options.model,
       effort: options.effort
     });
     try {
       await this.send(worker.id, options.prompt, `${options.idempotencyKey}-turn`, { outputSchema: options.schema });
       let finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
-      if (finished.turn?.status !== "completed") throw new Error(`Sol review did not complete: ${finished.turn?.status ?? "unknown"}.`);
+      if (finished.turn?.status !== "completed") throw new Error(`review did not complete: ${finished.turn?.status ?? "unknown"}.`);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const parsed = JSON.parse(finished.lastOutput ?? "");
-          return { worker, review: validateSolReview(parsed, { reviewId: options.reviewId, passId: options.passId }) };
+          return { worker, review: validateReviewerOutput(parsed, { reviewId: options.reviewId, passId: options.passId }) };
         } catch (error) {
           const diagnostic = String(finished.lastOutput ?? "").slice(0, 16384);
           this.store.writeArtifact(options.orchestrationId, `reviews/${options.reviewId}/passes/${options.passId}-invalid-${attempt + 1}.txt`, diagnostic);
-          if (attempt === 1) throw new Error(`Sol returned invalid structured review output after one repair attempt: ${error.message}`);
+          if (attempt === 1) throw new Error(`Reviewer returned invalid structured review output after one repair attempt: ${error.message}`);
           await this.send(
             worker.id,
             `Your previous structured review was invalid: ${error.message}. Return a corrected complete JSON review only; preserve all supported findings.`,
@@ -757,10 +795,10 @@ export class WorkerCoordinator {
             { outputSchema: options.schema }
           );
           finished = await this.wait(worker.id, options.timeoutMs ?? 30 * 60 * 1000);
-          if (finished.turn?.status !== "completed") throw new Error(`Sol review repair did not complete: ${finished.turn?.status ?? "unknown"}.`);
+          if (finished.turn?.status !== "completed") throw new Error(`review repair did not complete: ${finished.turn?.status ?? "unknown"}.`);
         }
       }
-      throw new Error("Sol review validation failed.");
+      throw new Error("review validation failed.");
     } finally {
       await this.close(worker.id).catch(() => {});
     }
@@ -997,7 +1035,7 @@ export class WorkerCoordinator {
 
   #finalizeWorkerResult(workerId) {
     const worker = this.status(workerId);
-    if (worker.role !== "luna") return;
+    if (roleKind(worker.role) !== "implementer") return;
     try {
       const result = validateWorkerResult(JSON.parse(worker.lastOutput ?? ""));
       const reportFile = this.store.writeArtifact(
@@ -1025,7 +1063,7 @@ export class WorkerCoordinator {
     const worker = this.status(workerId);
     const threadId = message.params?.threadId ?? worker.thread.id;
     const turnId = message.params?.turnId === undefined ? (worker.turn?.id ?? null) : message.params.turnId;
-    if (worker.role === "sol" && isApproval) throw new Error("Sol review workers cannot request mutation approval.");
+    if (roleKind(worker.role) === "reviewer" && isApproval) throw new Error("Review workers cannot request mutation approval.");
     if (threadId !== worker.thread.id || (message.method !== "mcpServer/elicitation/request" && (!turnId || turnId !== worker.turn?.id)) || (message.method === "mcpServer/elicitation/request" && turnId !== null && turnId !== worker.turn?.id)) {
       throw new Error("Server request does not match the active worker thread and turn.");
     }

@@ -100,7 +100,7 @@ function renderPackage(target, manifest, sections, extraSections = [], metadata 
     manifest: manifest.map(({ source, ...entry }) => entry)
   }, null, 2);
   return [
-    "# Immutable Sol Review Package",
+    "# Immutable Review Package",
     "",
     "## Manifest and pass ownership",
     "",
@@ -172,7 +172,7 @@ function buildManifestPartitions(target, collected, extraSections, packageHash, 
       const content = renderPackage(target, [group.entry], [{ path: group.entry.path, title: `Bounded segment ${index + 1}/${chunks.length}: ${group.entry.path}`, body }], extraSections, {
         originalPackageHash: packageHash, passKind: "path-segment", ownedPaths: [group.entry.path], coveragePart: `${index + 1}/${chunks.length}`
       });
-      if (Buffer.byteLength(content) > maxBytes) throw new Error(`Unable to enforce the configured Sol input bound for ${group.entry.path}.`);
+      if (Buffer.byteLength(content) > maxBytes) throw new Error(`Unable to enforce the configured review input bound for ${group.entry.path}.`);
       partitions.push({ paths: [group.entry.path], content });
     });
   }

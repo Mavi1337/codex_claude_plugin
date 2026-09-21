@@ -85,7 +85,8 @@ async function main() {
     if (action === "start") {
       params.orchestrationId = assertSafeId(required(options, "orchestration"), "orchestration");
       params.cwd = cwd;
-      params.effort = options.effort;
+      params.model = required(options, "model");
+      params.effort = required(options, "effort");
       params.maxInputTokens = options["max-input-tokens"] ? Number(options["max-input-tokens"]) : undefined;
       params.target = {
         base: options.base,
@@ -117,8 +118,9 @@ async function main() {
         ...params,
         orchestrationId: assertSafeId(required(options, "orchestration"), "orchestration"),
         cwd,
-        role: options.role ?? "luna",
-        effort: options.effort,
+        role: options.role ?? "implementer",
+        model: required(options, "model"),
+        effort: required(options, "effort"),
         base: options.base,
         allowedPaths: options["allowed-path"],
         requirementPaths: options.requirement
@@ -160,8 +162,7 @@ try {
   process.stdout.write(`${JSON.stringify(response)}\n`);
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
-  process.exitCode = /Missing|required|Unknown|must match|Usage/.test(error.message)
-    ? 2
-    : error.code === "COMPATIBILITY" ? 3
+  process.exitCode = error.code === "COMPATIBILITY" ? 3
+    : /Missing|required|Unknown|must match|Usage/.test(error.message) ? 2
       : error.code === "UNAUTHORIZED" ? 4 : 1;
 }

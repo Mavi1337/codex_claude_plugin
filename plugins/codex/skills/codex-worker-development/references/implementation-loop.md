@@ -2,7 +2,8 @@
 
 ## Per task
 
-1. Start an explicit Luna worker with the shared orchestration ID, every
+1. Start an explicit implementer with
+   `worker start --worker ID --orchestration ID --role implementer --model gpt-6-astra --effort low`, every
    declared `--allowed-path`, and each binding plan/spec via `--requirement`.
    Its isolated worktree is created from the current accepted integration HEAD.
 2. Send one focused instruction referencing the plan/spec paths, exact task,
@@ -19,10 +20,11 @@
      report and inspect the worktree when needed.
 4. Ask the coordinator to commit only the declared allowed paths. Record its
    full base, tree, and head object IDs.
-5. Start a fresh task review with `--worker WORKER --task-review`. Read both
+5. Start a fresh task review with
+   `review start --review ID --orchestration ID --model gpt-6-astra --effort low --worker WORKER --task-review`. Read both
    verdicts and use the canonical report.
 6. If blocked, adjudicate each material finding. Send confirmed changes to the
-   same Luna worker, wait, commit again, and start a fresh re-review ID. Preserve
+   same implementer worker, wait, commit again, and start a fresh re-review ID. Preserve
    finding IDs in the follow-up instruction.
 7. When the gate passes, capture the current integration HEAD and run
    `integration apply --expected-head OID`. A stale-HEAD or conflict response is
@@ -30,7 +32,13 @@
 
 ## Concurrency
 
-Run up to five inference turns across Luna and Sol. Keep tasks sequential when
+The commands above show the normal Astra/low selection. If the user selected
+another model or effort for either lane, substitute those exact flags on every
+start, including replacement implementers and re-reviews. Luna selects
+`gpt-5.6-luna`, Sol selects `gpt-5.6-sol`, Astra selects `gpt-6-astra`; none changes
+the role or its permissions. Apply Astra prompting only to Astra selections.
+
+Run up to five inference turns across Implementer and Reviewer. Keep tasks sequential when
 they share files/interfaces or have unmet dependencies. A blocking callback
 releases an inference slot but the task remains active. Update the ledger after
 every commit, review, ruling, and integration.

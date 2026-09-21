@@ -2,9 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a reusable, interactive, resumable Luna/Sol worker runtime to the existing Claude Code Codex plugin.
+**Goal:** Add a reusable, interactive, resumable implementer/reviewer worker runtime to the existing Claude Code Codex plugin.
 
-**Architecture:** One detached coordinator per Git common repository owns all direct app-server clients, scheduling, blocking server requests, durable state, artifacts, and Git integration. Claude-facing commands and skills are thin clients; Luna edits in isolated worktrees, the coordinator commits, and fresh read-only Sol turns review immutable packages.
+**Revision:** 2026-09-21. Roles and model identities are independent. The current
+increment is tracked in `2026-09-21-model-role-separation.md`; this original plan
+records the architecture, not a request to reimplement already completed modules.
+
+**Architecture:** One detached coordinator per Git common repository owns all direct app-server clients, scheduling, blocking server requests, durable state, artifacts, and Git integration. Claude-facing commands and skills are thin clients; Implementer edits in isolated worktrees, the coordinator commits, and fresh read-only Reviewer turns review immutable packages.
 
 **Tech Stack:** Node.js ESM, newline-delimited JSON-RPC, Codex app-server, Git worktrees, JSON Schema, Claude Code plugin commands/skills, Node test runner.
 
@@ -14,8 +18,13 @@
 
 - Existing commands and installed plugin-cache files remain unchanged.
 - Repository-wide inference concurrency defaults to five.
-- Luna is `gpt-5.6-luna`/`xhigh`, workspace-write, `on-request`; Luna never writes Git metadata.
-- Sol is `gpt-5.6-sol`, read-only, fresh; task review is `high`, final/synthesis is `xhigh`.
+- `implementer` is workspace-write in an isolated worktree with `on-request` approvals; it never writes Git metadata.
+- `reviewer` is read-only, ephemeral and uses approval policy `never`.
+- Every start requires model and effort, validated against paginated `model/list`
+  and forwarded exactly. Orchestration explicitly recommends Astra/low; requested
+  Luna, Sol or other exposed models work for either role. Review passes and
+  synthesis retain the selection. Astra prompting applies only to Astra.
+- Only saved legacy luna/sol records migrate on resume; new legacy roles fail.
 - The coordinator is the sole durable-state, artifact, scheduler, and integration writer.
 - All Git commands use argv arrays with no shell; hooks and signing are disabled for coordinator commits.
 - Review input defaults to 190K tokens within a 258K conservative cap and never truncates silently.
@@ -96,27 +105,28 @@
 - Create: `plugins/codex/scripts/lib/review-target.mjs`
 - Create: `plugins/codex/scripts/lib/review-package.mjs`
 - Create: `plugins/codex/schemas/worker-turn-output.schema.json`
-- Create: `plugins/codex/schemas/sol-review-output.schema.json`
-- Create: `plugins/codex/prompts/luna-implementer.md`
-- Create: `plugins/codex/prompts/sol-task-reviewer.md`
-- Create: `plugins/codex/prompts/sol-re-reviewer.md`
-- Create: `plugins/codex/prompts/sol-branch-reviewer.md`
+- Create: `plugins/codex/schemas/reviewer-output.schema.json`
+- Create: `plugins/codex/prompts/implementer.md`
+- Create: `plugins/codex/prompts/task-reviewer.md`
+- Create: `plugins/codex/prompts/re-reviewer.md`
+- Create: `plugins/codex/prompts/branch-reviewer.md`
 - Test: `tests/worker-review.test.mjs`
 
 **Interfaces:**
-- Produces: `resolveWorkerReviewTarget`, `freezeReviewPackage`, `validateWorkerResult`, `validateSolReview`, `evaluateReviewGate`, coordinator `review start|status|result`.
+- Produces: `resolveWorkerReviewTarget`, `freezeReviewPackage`, `validateWorkerResult`, `validateReviewerOutput`, `evaluateReviewGate`, coordinator `review start|status|result`.
 
 - [ ] Write failing tests for all target modes, immutable hashes, skipped-path manifests, repeatable file filters, schema/stable IDs, gate truth table, conservative budget accounting, partition coverage, and generic read-only `turn/start`.
 - [ ] Run the focused test and verify failures.
 - [ ] Implement target freezing, manifests/packages, schema validation, bounded raw-output handling, role prompts, pass partitioning, synthesis, reports, and coordinator review operations.
 - [ ] Re-run focused and full tests.
-- [ ] Commit `feat: add structured sol review engine`.
+- [ ] Commit `feat: add structured worker review engine`.
 
 ### Task 6: Claude commands and skills
 
 **Files:**
 - Create: `plugins/codex/commands/develop.md`
-- Create: `plugins/codex/commands/sol-review.md`
+- Create: `plugins/codex/commands/worker-review.md`
+- Preserve: `plugins/codex/commands/sol-review.md` as a legacy alias
 - Create: `plugins/codex/skills/codex-worker-runtime/SKILL.md`
 - Create: `plugins/codex/skills/codex-worker-development/SKILL.md`
 - Create: `plugins/codex/skills/codex-worker-development/references/implementation-loop.md`
@@ -124,7 +134,7 @@
 - Modify: `tests/commands.test.mjs`
 
 **Interfaces:**
-- Produces explicit `/codex:develop`, `/codex:sol-review`, reusable runtime skill, and discoverable implementation workflow.
+- Produces explicit `/codex:develop`, `/codex:worker-review`, the legacy alias, reusable runtime skill, and discoverable implementation workflow.
 
 - [ ] Run fresh-context baseline scenarios without the new skill and record failures to discover/use explicit worker IDs, resolve blocking requests correctly, and preserve controller review authority.
 - [ ] Add failing command-structure tests for thin CLI delegation, cost/concurrency preview, plan-task loop, canonical report handling, and Superpowers implementation-stage discovery wording.
@@ -145,8 +155,8 @@
 **Interfaces:**
 - Consumes all prior tasks; produces restart/session cleanup, capability diagnostics, user documentation, and the release gate.
 
-- [ ] Write a failing fake-runtime E2E test for two Luna tasks, one blocking request, two fresh Sol reviews, a fix/re-review, trusted commits, and approved-only integration.
+- [ ] Write a failing fake-runtime E2E test for two Implementer tasks, one blocking request, two fresh Reviews, a fix/re-review, trusted commits, and approved-only integration.
 - [ ] Implement bounded session shutdown, capability/status diagnostics, setup text, usage examples, and local development instructions.
 - [ ] Run `npm run build`, `npm test`, `npm run check-version`, `git diff --check`, and an opt-in fake coordinator smoke test.
-- [ ] Run a fresh Sol xhigh branch review; adjudicate findings with the review-reception workflow and repeat verification after fixes.
+- [ ] Run a fresh reviewer with explicitly selected model and effort; adjudicate findings and repeat verification after fixes. Normal tests use only fake fixtures.
 - [ ] Commit `test: verify codex worker development workflow`.

@@ -8,7 +8,7 @@ seven-item turn in this repository cost 82 model requests and 4.33M cumulative
 input tokens and exhausted a usage window; a three-item turn cost a fraction of
 that at the same effort.
 
-## Luna implementation brief (first message of a task)
+## Implementer brief (first message of a task)
 
 ```xml
 <task>
@@ -95,16 +95,18 @@ round's. Extend the revert-proof table with the new items.
 </verification_calibration>
 ```
 
-## Sol review brief
+## Reviewer brief
 
-Sol sees the diff, not the design document or the surrounding implementation.
-Say what it cannot see, or it will report the absence as a finding.
+The reviewer sees the frozen package, including any supplied task brief,
+requirements and implementation report. State the evidence boundary accurately;
+do not claim that supplied documents are absent.
 
 ```xml
 <task>
 Review this change for material correctness and regression risk.
-Context you do not have and should not treat as missing: [the spec, the callers,
-the sibling modules]. Judge the diff on its own terms.
+Evidence available: [the frozen package and its included requirements].
+Known limits: [any context intentionally outside the requested scope].
+Use cannot-verify when required evidence is missing.
 </task>
 
 <instruction_precedence>

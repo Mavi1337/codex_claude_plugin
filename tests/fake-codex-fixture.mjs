@@ -352,7 +352,9 @@ rl.on("line", (line) => {
           id: message.id,
           result: {
             data: BEHAVIOR === "missing-worker-models" ? [] : [
-                            { id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "low" }, { reasoningEffort: "medium", description: "medium" }, { reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] }
+              { id: "gpt-5.6-luna", model: "gpt-5.6-luna", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "low" }, { reasoningEffort: "medium", description: "medium" }, { reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] },
+              { id: "gpt-5.6-sol", model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "low" }, { reasoningEffort: "medium", description: "medium" }, { reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] },
+              { id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "low" }, { reasoningEffort: "medium", description: "medium" }, { reasoningEffort: "high", description: "high" }, { reasoningEffort: "xhigh", description: "xhigh" }] }
             ],
             nextCursor: null
           }
@@ -368,6 +370,7 @@ rl.on("line", (line) => {
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
         state.lastThreadStart = message.params;
+        (state.threadStarts ??= []).push(message.params);
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: message.params.approvalPolicy ?? "never", sandbox: message.params.sandbox === "workspace-write" ? { type: "workspaceWrite", writableRoots: [thread.cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false } : { type: "readOnly", networkAccess: false }, reasoningEffort: message.params.effort ?? null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
@@ -508,6 +511,7 @@ rl.on("line", (line) => {
 	          outputSchema: message.params.outputSchema ?? null,
 	          prompt
 	        };
+	        (state.turnStarts ??= []).push(state.lastTurnStart);
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 

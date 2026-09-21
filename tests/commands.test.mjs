@@ -82,7 +82,8 @@ test("continue is not exposed as a user-facing command", () => {
     "setup.md",
     "sol-review.md",
     "status.md",
-    "transfer.md"
+    "transfer.md",
+    "worker-review.md"
   ]);
 });
 
@@ -222,18 +223,37 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /\/codex:setup --disable-review-gate/);
 });
 
-test("worker development and flexible Sol review entrypoints are discoverable", () => {
+test("worker development and generic review entrypoints are discoverable", () => {
   const develop = read("commands/develop.md");
-  const solReview = read("commands/sol-review.md");
+  const workerReview = read("commands/worker-review.md");
   const developmentSkill = read("skills/codex-worker-development/SKILL.md");
   const runtimeSkill = read("skills/codex-worker-runtime/SKILL.md");
 
   assert.match(develop, /codex-worker-development/);
   assert.match(develop, /task count.*concurrency.*gpt-6-astra/is);
-  assert.match(solReview, /codex-workers\.mjs/);
-  assert.match(solReview, /branch|worktree|staged|unstaged|range|file|audit/i);
+  assert.match(workerReview, /codex-workers\.mjs/);
+  assert.match(workerReview, /branch|worktree|staged|unstaged|range|file|audit/i);
+  assert.match(read("commands/sol-review.md"), /legacy alias/i);
+  assert.match(read("commands/sol-review.md"), /worker-review/);
   assert.match(developmentSkill, /implementation plan is ready/i);
   assert.match(developmentSkill, /offer.*inline.*subagent.*Codex worker/is);
   assert.match(runtimeSkill, /worker resolve-request/);
   assert.match(runtimeSkill, /integration apply/);
+});
+
+test("worker workflows supply explicit profiles and scope Astra prompting to the selected model", () => {
+  for (const file of ["skills/codex-worker-runtime/SKILL.md", "skills/codex-worker-development/references/implementation-loop.md", "commands/worker-review.md", "commands/sol-review.md"]) {
+    const source = read(file);
+    assert.match(source, /--model gpt-6-astra --effort (low|medium|high|xhigh)/, file);
+    for (const command of source.matchAll(/`((?:worker|review) start[^`]+)`/g)) {
+      assert.match(command[1], /--model\s+\S+/, `${file}: ${command[1]}`);
+      assert.match(command[1], /--effort\s+\S+/, `${file}: ${command[1]}`);
+    }
+  }
+  const development = read("skills/codex-worker-development/SKILL.md");
+  assert.match(development, /implementer.*reviewer.*responsibilit/is);
+  assert.match(development, /gpt-5\.6-luna/);
+  assert.match(development, /gpt-5\.6-sol/);
+  assert.match(development, /only when.*selected model.*gpt-6-astra/is);
+  assert.match(read("skills/gpt-6-astra-prompting/SKILL.md"), /only when.*selected model.*gpt-6-astra/is);
 });

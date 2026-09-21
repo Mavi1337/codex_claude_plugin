@@ -1,15 +1,14 @@
 ---
 name: gpt-6-astra-prompting
-description: Internal guidance for composing prompts for GPT-6 Astra — the model behind every Luna worker and Sol reviewer in this plugin
+description: Internal guidance for composing prompts when the selected model is GPT-6 Astra
 user-invocable: false
 ---
 
 # GPT-6 Astra Prompting
 
-Use this skill when `codex-worker-development` composes a Luna task brief, when
-`codex-worker-runtime` starts a Sol review, or for any run the coordinator
-dispatches. Both roles run `gpt-6-astra` (`scripts/lib/worker-coordinator.mjs`),
-so this is the guide for both.
+Use this skill only when the selected model is `gpt-6-astra`, for either an
+implementer brief or reviewer brief. Roles do not select a model. Luna, Sol and
+other model selections must not inherit Astra-specific behavior claims.
 
 Use [gpt-5-4-prompting](../gpt-5-4-prompting/SKILL.md) instead only when the run
 is explicitly pinned to a 5.4-family model with `--model`, as `codex-rescue`
@@ -37,7 +36,7 @@ Detail and sources: [references/astra-behaviour-deltas.md](references/astra-beha
 
 ## Default brief shape
 
-For a Luna implementation brief, in this order:
+For an implementer implementation brief, in this order:
 
 1. `task` — the job, the paths, the end state.
 2. `instruction_precedence` — brief over requirement files over model defaults.
@@ -46,7 +45,7 @@ For a Luna implementation brief, in this order:
 5. `completeness_contract`, `verification_loop`, `verification_calibration`.
 6. `action_safety`, `missing_context_gating`.
 
-For a Sol or adversarial review: `task`, `instruction_precedence`,
+For a Reviewer or adversarial review: `task`, `instruction_precedence`,
 `grounding_rules`, `structured_output_contract` + `prose_style`,
 `dig_deeper_nudge`, `verification_loop`.
 
@@ -56,8 +55,8 @@ Assembled briefs for both roles live in [references/astra-brief-recipes.md](refe
 ## Working rules
 
 - **Keep briefs to three or four items.** Brief size is the cost lever, not
-  effort. `--effort low` is the floor the coordinator sets and the floor Astra
-  offers: it has no `none` level, and `minimal` is not a setting to fall back to.
+  effort. The workflow recommends explicit `--effort low`; the coordinator checks
+  the selected effort against `model/list` and never substitutes a fallback.
 - **Do not raise effort to fix a stalling worker.** A worker that asks instead of
   acting needs `initiative_and_scope`, not more reasoning.
 - **Name the authority when inputs can conflict.** Astra reads a passed

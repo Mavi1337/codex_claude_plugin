@@ -86,19 +86,20 @@ test("worker CLI lazily starts one authenticated coordinator and resumes the sam
     invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env });
   });
 
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-1", "--orchestration", "orch-1", "--role", "luna"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "worker-1", "--orchestration", "orch-1", "--role", "implementer", "--model", "gpt-5.6-luna", "--effort", "high"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
-  assert.equal(started.parsed.result.model, "gpt-6-astra");
-  assert.equal(started.parsed.result.effort, "low");
+  assert.equal(started.parsed.result.role, "implementer");
+  assert.equal(started.parsed.result.model, "gpt-5.6-luna");
+  assert.equal(started.parsed.result.effort, "high");
   assert.notEqual(started.parsed.result.cwd, repo);
   assert.equal(fs.existsSync(started.parsed.result.cwd), true);
 
-  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-1", "--prompt", "Inspect the task", "--idempotency-key", "send-1"], { cwd: repo, env });
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "worker-1", "--prompt", "Inspect the task", "--idempotency-key", "send-1"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
-  const waited = invoke(["worker", "wait", "--cwd", repo, "--worker", "luna-1", "--timeout", "2000"], { cwd: repo, env });
+  const waited = invoke(["worker", "wait", "--cwd", repo, "--worker", "worker-1", "--timeout", "2000"], { cwd: repo, env });
   assert.equal(waited.parsed.result.turn.status, "completed");
 
-  const status = invoke(["worker", "status", "--cwd", repo, "--worker", "luna-1"], { cwd: repo, env });
+  const status = invoke(["worker", "status", "--cwd", repo, "--worker", "worker-1"], { cwd: repo, env });
   assert.equal(status.parsed.result.thread.id, started.parsed.result.thread.id);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
@@ -120,13 +121,13 @@ test("worker CLI exits cleanly when stdout closes before JSON is consumed", asyn
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }); });
 
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-epipe", "--orchestration", "orch-epipe"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "implementer-epipe", "--orchestration", "orch-epipe", "--model", "gpt-6-astra", "--effort", "low"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
   const store = createWorkerStore(repo, { dataRoot });
-  store.transaction((state) => { state.workers["luna-epipe"].lastOutput = "x".repeat(128 * 1024); });
-  const full = invoke(["worker", "status", "--cwd", repo, "--worker", "luna-epipe"], { cwd: repo, env });
+  store.transaction((state) => { state.workers["implementer-epipe"].lastOutput = "x".repeat(128 * 1024); });
+  const full = invoke(["worker", "status", "--cwd", repo, "--worker", "implementer-epipe"], { cwd: repo, env });
   assert.ok(full.stdout.length > 128 * 1024);
-  const closed = await invokeWithEarlyStdoutClose(["worker", "status", "--cwd", repo, "--worker", "luna-epipe"], { cwd: repo, env });
+  const closed = await invokeWithEarlyStdoutClose(["worker", "status", "--cwd", repo, "--worker", "implementer-epipe"], { cwd: repo, env });
   assert.equal(closed.status, 0, closed.stderr);
   assert.doesNotMatch(closed.stderr, /EPIPE|Unhandled 'error' event|node:events/i);
 });
@@ -181,6 +182,62 @@ test("worker CLI rejects an unsafe explicit ID before contacting the coordinator
   assert.match(result.stderr, /worker/i);
 });
 
+test("worker and review starts require explicit model and effort", () => {
+  const repo = makeTempDir("worker-required-profile-repo-");
+  const dataRoot = makeTempDir("worker-required-profile-data-");
+  initGitRepo(repo);
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: dataRoot };
+
+  const workerWithoutModel = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "worker-1", "--orchestration", "orch-1", "--role", "implementer", "--effort", "high"], { cwd: repo, env });
+  assert.equal(workerWithoutModel.status, 2);
+  assert.match(workerWithoutModel.stderr, /missing required --model/i);
+
+  const workerWithoutEffort = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "worker-2", "--orchestration", "orch-1", "--role", "implementer", "--model", "gpt-6-astra"], { cwd: repo, env });
+  assert.equal(workerWithoutEffort.status, 2);
+  assert.match(workerWithoutEffort.stderr, /missing required --effort/i);
+
+  const reviewWithoutModel = run("node", [SCRIPT, "review", "start", "--cwd", repo, "--review", "review-1", "--orchestration", "orch-1", "--worktree", "--effort", "xhigh"], { cwd: repo, env });
+  assert.equal(reviewWithoutModel.status, 2);
+  assert.match(reviewWithoutModel.stderr, /missing required --model/i);
+  const reviewWithoutEffort = run("node", [SCRIPT, "review", "start", "--cwd", repo, "--review", "review-2", "--orchestration", "orch-1", "--worktree", "--model", "gpt-6-astra"], { cwd: repo, env });
+  assert.equal(reviewWithoutEffort.status, 2);
+  assert.match(reviewWithoutEffort.stderr, /missing required --effort/i);
+});
+
+test("worker CLI classifies unsupported effort as compatibility failure", (t) => {
+  const repo = makeTempDir("worker-effort-repo-");
+  const dataRoot = makeTempDir("worker-effort-data-");
+  const binDir = makeTempDir("worker-effort-bin-");
+  initGitRepo(repo);
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
+  const result = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "bad-effort", "--orchestration", "orch-1", "--role", "reviewer", "--model", "gpt-6-astra", "--effort", "unsupported", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 3);
+  assert.match(result.stderr, /does not support.*effort.*unsupported/i);
+});
+
+test("review compatibility failures retain the selected profile and error code", (t) => {
+  const repo = makeTempDir("review-unavailable-repo-");
+  const dataRoot = makeTempDir("review-unavailable-data-");
+  const binDir = makeTempDir("review-unavailable-bin-");
+  initGitRepo(repo);
+  run("git", ["commit", "--allow-empty", "-m", "base"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), "new source\n");
+  installFakeCodex(binDir, "review-ok");
+  const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
+  t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
+  for (const [model, effort] of [["unavailable", "high"], ["gpt-6-astra", "unsupported"]]) {
+    const reviewId = `bad-${effort}`;
+    invoke(["review", "start", "--cwd", repo, "--review", reviewId, "--orchestration", "orch-1", "--worktree", "--model", model, "--effort", effort], { cwd: repo, env });
+    const result = waitForReview(reviewId, repo, env).parsed.result;
+    assert.equal(result.status, "failed");
+    assert.equal(result.errorCode, "COMPATIBILITY");
+    assert.equal(result.model, model);
+    assert.equal(result.effort, effort);
+  }
+});
+
 test("worker CLI fails compatibly instead of silently substituting a missing model", (t) => {
   const repo = makeTempDir("worker-model-repo-");
   const dataRoot = makeTempDir("worker-model-data-");
@@ -192,12 +249,12 @@ test("worker CLI fails compatibly instead of silently substituting a missing mod
   installFakeCodex(binDir, "missing-worker-models");
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
-  const result = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "luna-1", "--orchestration", "orch-1", "--json"], { cwd: repo, env });
+  const result = run("node", [SCRIPT, "worker", "start", "--cwd", repo, "--worker", "worker-1", "--orchestration", "orch-1", "--model", "gpt-6-astra", "--effort", "low", "--json"], { cwd: repo, env });
   assert.equal(result.status, 3);
   assert.match(result.stderr, /gpt-6-astra.*unavailable/i);
 });
 
-test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t) => {
+test("review CLI runs a fresh Reviewer xhigh turn over a frozen worktree package", (t) => {
   const repo = makeTempDir("review-cli-repo-");
   const dataRoot = makeTempDir("review-cli-data-");
   const binDir = makeTempDir("review-cli-bin-");
@@ -210,7 +267,7 @@ test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
 
-  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-1", "--orchestration", "orch-1", "--worktree", "--effort", "xhigh"], { cwd: repo, env });
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-1", "--orchestration", "orch-1", "--worktree", "--model", "gpt-5.6-sol", "--effort", "xhigh"], { cwd: repo, env });
   assert.equal(accepted.parsed.result.status, "running");
   const reviewed = waitForReview("review-1", repo, env);
   assert.equal(reviewed.parsed.result.gate.status, "pass");
@@ -219,13 +276,14 @@ test("review CLI runs a fresh Sol xhigh turn over a frozen worktree package", (t
   assert.equal(fs.existsSync(reviewed.parsed.result.reportFile), true);
 
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
-  assert.equal(state.lastTurnStart.model, "gpt-6-astra");
+  assert.equal(state.lastTurnStart.model, "gpt-5.6-sol");
   assert.equal(state.lastTurnStart.effort, "xhigh");
   assert.equal(state.lastThreadStart.config.model_context_window, 258000);
   assert.equal(state.lastThreadStart.config.model_auto_compact_token_limit, 220000);
 });
 
-test("oversized Sol review runs bounded passes and a fresh default-effort synthesis", (t) => {
+for (const [model, effort] of [["gpt-6-astra", "high"], ["gpt-5.6-luna", "medium"], ["gpt-5.6-sol", "xhigh"]]) {
+test(`oversized review retains explicit ${model}/${effort} across all passes and synthesis`, (t) => {
   const repo = makeTempDir("review-split-repo-");
   const dataRoot = makeTempDir("review-split-data-");
   const binDir = makeTempDir("review-split-bin-");
@@ -239,20 +297,35 @@ test("oversized Sol review runs bounded passes and a fresh default-effort synthe
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
 
-  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-split", "--orchestration", "orch-1", "--worktree", "--max-input-tokens", "2000"], { cwd: repo, env });
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "review-split", "--orchestration", "orch-1", "--worktree", "--model", model, "--effort", effort, "--max-input-tokens", "2000"], { cwd: repo, env });
   assert.equal(accepted.parsed.result.status, "running");
   const reviewed = waitForReview("review-split", repo, env);
   assert.ok(reviewed.parsed.result.passCount >= 2);
   assert.equal(reviewed.parsed.result.synthesized, true);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.ok(state.appServerStarts >= 3);
-  assert.equal(state.lastTurnStart.effort, "low");
+  assert.equal(reviewed.parsed.result.model, model);
+  assert.equal(reviewed.parsed.result.effort, effort);
+  assert.equal(state.threadStarts.length, reviewed.parsed.result.passCount + 1);
+  for (const params of state.threadStarts) {
+    assert.equal(params.model, model);
+    assert.equal(params.config.model_reasoning_effort, effort);
+    assert.equal(params.ephemeral, true);
+    assert.equal(params.sandbox, "read-only");
+    assert.equal(params.approvalPolicy, "never");
+  }
+  assert.equal(state.turnStarts.length, reviewed.parsed.result.passCount + 1);
+  for (const params of state.turnStarts) {
+    assert.equal(params.model, model);
+    assert.equal(params.effort, effort);
+  }
   const synthesisInput = JSON.parse(fs.readFileSync(path.join(path.dirname(reviewed.parsed.result.reportFile), "synthesis-input.json"), "utf8"));
   assert.ok(synthesisInput.passReviews.length >= 2);
   assert.equal(synthesisInput.passReviews.every((pass) => typeof pass.passId === "string" && Array.isArray(pass.paths) && /^[a-f0-9]{64}$/.test(pass.packageHash)), true);
 });
+}
 
-test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed commits", (t) => {
+test("CLI commits Implementer work, gates it through fresh Reviewer, and applies reviewed commits", (t) => {
   const repo = makeTempDir("worker-integrate-repo-");
   const dataRoot = makeTempDir("worker-integrate-data-");
   const binDir = makeTempDir("worker-integrate-bin-");
@@ -264,25 +337,25 @@ test("CLI commits Luna work, gates it through fresh Sol, and applies reviewed co
   installFakeCodex(binDir, "review-ok");
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => invoke(["coordinator", "shutdown", "--cwd", repo], { cwd: repo, env }));
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-task", "--orchestration", "orch-1", "--allowed-path", "app.js", "--requirement", "app.js"], { cwd: repo, env });
-  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-task", "--prompt", "Implement app.js and verify it", "--idempotency-key", "task-send"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "implementer-task", "--orchestration", "orch-1", "--model", "gpt-6-astra", "--effort", "low", "--allowed-path", "app.js", "--requirement", "app.js"], { cwd: repo, env });
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "implementer-task", "--prompt", "Implement app.js and verify it", "--idempotency-key", "task-send"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
-  const waited = invoke(["worker", "wait", "--cwd", repo, "--worker", "luna-task", "--timeout", "2000"], { cwd: repo, env });
+  const waited = invoke(["worker", "wait", "--cwd", repo, "--worker", "implementer-task", "--timeout", "2000"], { cwd: repo, env });
   assert.equal(waited.parsed.result.turn.status, "completed");
   fs.writeFileSync(path.join(started.parsed.result.cwd, "app.js"), "implemented\n");
 
-  const committed = invoke(["integration", "commit", "--cwd", repo, "--worker", "luna-task", "--message", "task: implement", "--allowed-path", "app.js"], { cwd: repo, env });
+  const committed = invoke(["integration", "commit", "--cwd", repo, "--worker", "implementer-task", "--message", "task: implement", "--allowed-path", "app.js"], { cwd: repo, env });
   assert.equal(committed.status, 0, committed.stderr);
-  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "task-review", "--orchestration", "orch-1", "--worker", "luna-task", "--task-review"], { cwd: repo, env });
+  const accepted = invoke(["review", "start", "--cwd", repo, "--review", "task-review", "--orchestration", "orch-1", "--worker", "implementer-task", "--model", "gpt-6-astra", "--effort", "low", "--task-review"], { cwd: repo, env });
   assert.equal(accepted.parsed.result.status, "running");
   const reviewed = waitForReview("task-review", repo, env);
   assert.equal(reviewed.parsed.result.gate.status, "pass");
   const reviewPackage = fs.readFileSync(reviewed.parsed.result.packageFile, "utf8");
   assert.match(reviewPackage, /Binding task brief/);
-  assert.match(reviewPackage, /Validated Luna implementation report/);
+  assert.match(reviewPackage, /Validated implementation report/);
   assert.match(reviewPackage, /Binding requirement and specification sources/);
   assert.match(reviewPackage, /Implement app\.js and verify it/);
-  const applied = invoke(["integration", "apply", "--cwd", repo, "--worker", "luna-task", "--expected-head", base], { cwd: repo, env });
+  const applied = invoke(["integration", "apply", "--cwd", repo, "--worker", "implementer-task", "--expected-head", base], { cwd: repo, env });
   assert.equal(applied.status, 0, applied.stderr);
   assert.equal(fs.readFileSync(path.join(repo, "app.js"), "utf8"), "implemented\n");
 });
@@ -297,7 +370,7 @@ test("session end closes coordinator app-servers while preserving worker state",
   run("git", ["commit", "-m", "base"], { cwd: repo });
   installFakeCodex(binDir, "review-ok");
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-session", "--orchestration", "orch-1"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "implementer-session", "--orchestration", "orch-1", "--model", "gpt-6-astra", "--effort", "low"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
   const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -361,12 +434,12 @@ test("worker wait reconnects after the shared coordinator is disrupted", async (
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo, "--force"], { cwd: repo, env }); });
 
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-reconnect", "--orchestration", "orch-reconnect"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "implementer-reconnect", "--orchestration", "orch-reconnect", "--model", "gpt-6-astra", "--effort", "low"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
-  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-reconnect", "--prompt", "Long-running work", "--idempotency-key", "send-reconnect"], { cwd: repo, env });
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "implementer-reconnect", "--prompt", "Long-running work", "--idempotency-key", "send-reconnect"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
 
-  const waiting = invokeAsync(["worker", "wait", "--cwd", repo, "--worker", "luna-reconnect", "--timeout", "0"], { cwd: repo, env });
+  const waiting = invokeAsync(["worker", "wait", "--cwd", repo, "--worker", "implementer-reconnect", "--timeout", "0"], { cwd: repo, env });
   let coordinatorPid = null;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const observed = invoke(["coordinator", "status", "--cwd", repo], { cwd: repo, env });
@@ -396,14 +469,14 @@ test("coordinator restart refuses live turns unless forced", (t) => {
   const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, CLAUDE_PLUGIN_DATA: dataRoot };
   t.after(() => { invoke(["coordinator", "shutdown", "--cwd", repo, "--force"], { cwd: repo, env }); });
 
-  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "luna-guard", "--orchestration", "orch-guard"], { cwd: repo, env });
+  const started = invoke(["worker", "start", "--cwd", repo, "--worker", "implementer-guard", "--orchestration", "orch-guard", "--model", "gpt-6-astra", "--effort", "low"], { cwd: repo, env });
   assert.equal(started.status, 0, started.stderr);
-  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "luna-guard", "--prompt", "Long-running work", "--idempotency-key", "send-guard"], { cwd: repo, env });
+  const sent = invoke(["worker", "send", "--cwd", repo, "--worker", "implementer-guard", "--prompt", "Long-running work", "--idempotency-key", "send-guard"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
 
   const refused = invoke(["coordinator", "restart", "--cwd", repo], { cwd: repo, env });
   assert.equal(refused.status, 1);
-  assert.match(refused.stderr, /luna-guard.*orch-guard|orch-guard.*luna-guard/i);
+  assert.match(refused.stderr, /implementer-guard.*orch-guard|orch-guard.*implementer-guard/i);
 
   const forced = invoke(["coordinator", "restart", "--cwd", repo, "--force"], { cwd: repo, env });
   assert.equal(forced.status, 0, forced.stderr);
